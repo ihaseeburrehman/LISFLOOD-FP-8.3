@@ -286,6 +286,7 @@ drain_nodata_water
 				NUMERIC_TYPE& Hval = H[j*cuda::pitch + i];
 				NUMERIC_TYPE Hold = Hval;
 				Hval = C(0.0);
+				if (Hold == C(0.0)) continue; // dry: nothing to add to the mass balance
 
 				NUMERIC_TYPE Q = -Hold * cuda::geometry.dx * cuda::geometry.dy
 					/ cuda::dt;
@@ -317,6 +318,7 @@ drain_nodata_waterACC
 				NUMERIC_TYPE& Hval = H[j*cuda::pitch + i];
 				NUMERIC_TYPE Hold = Hval;
 				Hval = C(0.0);
+				if (Hold == C(0.0)) continue; // dry: nothing to add to the mass balance
 
 				NUMERIC_TYPE Q = -Hold * cuda::geometry.dx * cuda::geometry.dy
 					/ cuda::dt;

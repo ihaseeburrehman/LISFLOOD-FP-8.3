@@ -1,0 +1,11 @@
+# Dam break on a dry, flat, frictionless bed (Ritter 1892), FV1, 5 m grid.
+# A 1 m deep column of water (x < 1000 m) is released at t = 0.
+resroot         r
+DEMfile         dambreak.dem.asc
+startfile       dambreak.start
+fv1
+fpfric          0.0
+sim_time        60
+initial_tstep   0.1
+massint         10
+saveint         20

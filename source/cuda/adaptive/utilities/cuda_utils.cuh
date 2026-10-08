@@ -7,7 +7,7 @@
 #include "cstdio"
 
 __host__
-cudaError_t sync();
+cudaError_t sync_device();
 
 __host__
 cudaError_t peek();

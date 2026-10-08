@@ -358,9 +358,7 @@ update_flow_variables_x
 
 			__syncthreads();
 
-			if (threadIdx.x == 0) continue;
-
-			if (i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
+			if (threadIdx.x != 0 && i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
 			{
 				FlowVector& F_w = F[threadIdx.y][threadIdx.x-1];
 				FlowVector U0 = Uold[j*cuda::pitch + i];
@@ -379,6 +377,8 @@ update_flow_variables_x
 				HV = U0.HV - cuda::dt * (F_e.HV - F_w.HV)/cuda::geometry.dx;
 
 			}
+			// shared memory is rewritten in the next pass: wait for every reader
+			__syncthreads();
 		}
 	}
 }
@@ -453,9 +453,7 @@ update_flow_variables_y
 
                         __syncthreads();
 
-                        if (threadIdx.y == 0) continue;
-
-			if (i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
+			if (threadIdx.y != 0 && i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
 			{
 				FlowVector& F_n = F[threadIdx.y-1][threadIdx.x];
 				FlowVector U0 = Uint[j*cuda::pitch + i];
@@ -474,6 +472,8 @@ update_flow_variables_y
 					- bed_source_y(Zstar_s, Zstar_n, Ustar_pos.H, Hstar_n, ETA));
 			
 			}
+			// shared memory is rewritten in the next pass: wait for every reader
+			__syncthreads();
         }
     }
 }

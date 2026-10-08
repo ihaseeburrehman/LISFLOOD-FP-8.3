@@ -1,0 +1,12 @@
+DEMfile		dynamicrain.dem
+dynamicrainfile	dynamicrain.nc
+resroot		dynamicrain
+dirroot		results
+
+sim_time	3.0
+initial_tstep	1.0
+saveint		1.0
+massint		1e-9
+fpfric		0.02
+
+fv1

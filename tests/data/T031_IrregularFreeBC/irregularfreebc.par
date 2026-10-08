@@ -1,0 +1,14 @@
+DEMfile		irregularfreebc.dem
+bcifile		irregularfreebc.bci
+resroot		irregularfreebc
+dirroot		results
+
+sim_time	20.0
+initial_tstep	0.1
+saveint		0.5
+massint		1e-9
+fpfric		0.05
+nodata_elevation -1e4
+drain_nodata
+
+fv1

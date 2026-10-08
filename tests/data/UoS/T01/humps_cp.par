@@ -1,0 +1,15 @@
+DEMfile         humps.dem
+resroot         humps_cp
+dirroot         humps_cp
+sim_time        600
+initial_tstep   10.0
+massint         10.0
+saveint         100
+fpfric          0.04    	
+elevoff	
+voutput
+#acceleration
+#fv1
+dg2
+cuda
+startfile       humps_cp.wd

@@ -93,18 +93,9 @@ offset(offset),
 grid_size(grid_size),
 precision(precision)
 {
-	if (acceleration) {
-		maxH = GhostRaster::allocate_pinned_H(geometry); //// change to allocate_pinned_H()
-		totalHtm = GhostRaster::allocate_pinned_H(geometry);
-		maxHtm = GhostRaster::allocate_pinned_H(geometry);
-		initHtm = GhostRaster::allocate_pinned_H(geometry);
-	}
-	else {
-		maxH = GhostRaster::allocate_pinned(geometry); //// change to allocate_pinned_H()
-		totalHtm = GhostRaster::allocate_pinned(geometry);
-		maxHtm = GhostRaster::allocate_pinned(geometry);
-		initHtm = GhostRaster::allocate_pinned(geometry);
-	}
+	// device memory, padded like every grid the kernels index
+	maxH = GhostRaster::allocate_device(geometry);
+	cudaMemset(maxH, 0, lis::GhostRaster::elements(geometry)*sizeof(NUMERIC_TYPE));
 }
 
 void lis::cuda::MaxField::update
@@ -130,13 +121,16 @@ void lis::cuda::MaxField::write()
 
 	FILE* file = fopen_or_die(filename, "wb");
 	
-	AsciiRaster::write(file, maxH, geometry, pitch, offset, NULLVAL,0,
+	NUMERIC_TYPE* h_maxH = GhostRaster::allocate_pinned(geometry);
+	cuda::copy(h_maxH, maxH, lis::GhostRaster::elements(geometry)*sizeof(NUMERIC_TYPE));
+	AsciiRaster::write(file, h_maxH, geometry, pitch, offset, NULLVAL,0,
 			precision);
 
 	fclose(file);
+	free_pinned(h_maxH);
 }
 
 lis::cuda::MaxField::~MaxField()
 {
-	free_pinned(maxH);
+	free_device(maxH);
 }

@@ -41,6 +41,7 @@ int main(int argc, char *argv[])
 	States *Statesptr = &states;
 
 	Pars pars;
+	pars.nodata_elevation = DEM_NO_DATA; // same default as lisflood.cpp
 	Pars *Parptr = &pars;
 
 	Solver solver;

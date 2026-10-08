@@ -1,7 +1,7 @@
 #include "../utilities/cuda_utils.cuh"
 
 __host__
-cudaError_t sync()
+cudaError_t sync_device()
 {
 	return cudaDeviceSynchronize();
 }

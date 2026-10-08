@@ -1,0 +1,12 @@
+build/
+build*/
+work/
+quick_test_work*
+__pycache__/
+.DS_Store
+paper/cases/ea_test4/*.dem
+paper/cases/ea_test4/reference-*/
+paper/cases/alzette/*.asc
+paper/cases/alzette/*.ascii
+paper/cases/alzette/*.nc
+paper/cases/alzette/*.wd

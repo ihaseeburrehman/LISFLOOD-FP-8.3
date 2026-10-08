@@ -1,0 +1,18 @@
+resroot                  1hr
+
+DEMfile                  Alzette_sub_basin_10m_bridge_burn.asc
+manningfile              manning.n.ascii
+dynamicrainfile          rain_wrf1p3_24h_from_14jul18.nc
+startfile                start_14jul_18hr.wd
+
+fv1
+
+sim_time                 86400
+initial_tstep            10
+massint                  600
+saveint                  3600
+
+bcifile                  Border.bci
+nodata_elevation         -9999
+drain_nodata
+qoutput

@@ -962,10 +962,11 @@ void CheckParam(char* param_name, char* param_value_ptr, int line_number, Fnames
 			return;
 	}
 
-	if (read_empty_param(param_name, line_number, param_value_ptr, "cuda", verbose, mode))
+	if (read_empty_param(param_name, line_number, param_value_ptr, "cuda", verbose, mode) ||
+		read_empty_param(param_name, line_number, param_value_ptr, "metal", verbose, mode))
 	{
-		Statesptr->cuda = ON;
-		if (verbose == ON) printf("CUDA enabled\n");
+		Statesptr->cuda = ON; // the GPU switch, for CUDA and Metal alike
+		if (verbose == ON) printf("GPU enabled\n");
         return;
 	}
 
@@ -1076,7 +1077,7 @@ void CheckParams(Fnames *Fnameptr, States *Statesptr, Pars *Parptr, Solver *Solv
 		exit(1);
 	}
 
-#ifndef CUDA
+#if !defined(CUDA) && !defined(METAL_ENABLED)
 	if (Statesptr->cuda == ON)
 	{
 		printf("\nERROR: lisflood has not been compiled with CUDA support. Aborting...\n\n");

@@ -1,0 +1,11 @@
+cuda
+fv1
+startfile		fv1.start
+DEMfile			fv1.dem.ascii
+resroot			fv1
+dirroot			results
+sim_time		100
+initial_tstep		1e-2
+saveint			10
+fpfric			0.0
+adaptoff

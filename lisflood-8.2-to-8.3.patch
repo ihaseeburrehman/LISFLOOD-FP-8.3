@@ -1,0 +1,2999 @@
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2024-02-13 02:40:08
++++ b/CMakeLists.txt	2026-10-08 21:46:09
+@@ -201,7 +201,7 @@
+ 	target_link_libraries(lisflood-base INTERFACE OpenMP::OpenMP_CXX)
+ endif()
+ 
+-if (UNIX)
++if (UNIX AND NOT APPLE)
+ 	find_package(NUMA REQUIRED)
+ 	target_include_directories(lisflood-base INTERFACE ${NUMA_INCLUDE_DIRS})
+ 	target_link_libraries(lisflood-base INTERFACE ${NUMA_LIBRARIES})
+@@ -226,4 +226,12 @@
+ 
+ if (CMAKE_BUILD_TYPE MATCHES Debug)
+ 	target_compile_definitions(lisflood-base INTERFACE _DEBUG)
++endif()
++
++# Metal GPU back end for FV1 (Apple Silicon)
++if (APPLE)
++	add_subdirectory(metal)
++	if (METAL_ENABLED)
++		target_link_libraries(lisflood PRIVATE ${METAL_LIBRARY})
++	endif()
+ endif()
+diff -ruN a/VersionHistory.h b/VersionHistory.h
+--- a/VersionHistory.h	2022-12-07 20:44:54
++++ b/VersionHistory.h	2026-10-08 21:46:09
+@@ -18,12 +18,18 @@
+ #define LF_VersionInc   0
+ #define LF_CheckVersion 0
+ 
++// release name printed at start-up; the numbers above stay as in 8.2
++// because they are written into checkpoint files
++#define LF_Release "8.3"
++
+ /*
+ ########################### Version History #########################################
+ Reserved for major changes, use list below this one and subversion for full details
+ 
+ Ver  Date         Details
+ ---  ----         -------------------------------------------------------------------------
++8.3  Oct 07 2026  CUDA: max-depth grid on the GPU (large grids run), dry NoData cells skip
++                  the mass counter, flux kernels synchronised; Metal FV1 back end (HR)
+ 8.1  Nov 23 2020  Merged changes from v7.1 (d8subgrid) into v8 (PFU)
+ 8.0  Jul 24 2020  FV1 and DG2 Solvers added (JS)
+ 7.1  Oct 01 2019  D8 directions option for subgrid channels. (PFU)
+diff -ruN a/cuda/adaptive/utilities/cuda_utils.cu b/cuda/adaptive/utilities/cuda_utils.cu
+--- a/cuda/adaptive/utilities/cuda_utils.cu	2022-12-12 22:48:18
++++ b/cuda/adaptive/utilities/cuda_utils.cu	2026-10-08 21:46:09
+@@ -1,7 +1,7 @@
+ #include "../utilities/cuda_utils.cuh"
+ 
+ __host__
+-cudaError_t sync()
++cudaError_t sync_device()
+ {
+ 	return cudaDeviceSynchronize();
+ }
+diff -ruN a/cuda/adaptive/utilities/cuda_utils.cuh b/cuda/adaptive/utilities/cuda_utils.cuh
+--- a/cuda/adaptive/utilities/cuda_utils.cuh	2022-12-12 22:48:18
++++ b/cuda/adaptive/utilities/cuda_utils.cuh	2026-10-08 21:46:09
+@@ -7,7 +7,7 @@
+ #include "cstdio"
+ 
+ __host__
+-cudaError_t sync();
++cudaError_t sync_device();
+ 
+ __host__
+ cudaError_t peek();
+diff -ruN a/cuda/cuda_boundary.cu b/cuda/cuda_boundary.cu
+--- a/cuda/cuda_boundary.cu	2022-12-07 20:44:54
++++ b/cuda/cuda_boundary.cu	2026-10-08 21:46:09
+@@ -286,6 +286,7 @@
+ 				NUMERIC_TYPE& Hval = H[j*cuda::pitch + i];
+ 				NUMERIC_TYPE Hold = Hval;
+ 				Hval = C(0.0);
++				if (Hold == C(0.0)) continue; // dry: nothing to add to the mass balance
+ 
+ 				NUMERIC_TYPE Q = -Hold * cuda::geometry.dx * cuda::geometry.dy
+ 					/ cuda::dt;
+@@ -317,6 +318,7 @@
+ 				NUMERIC_TYPE& Hval = H[j*cuda::pitch + i];
+ 				NUMERIC_TYPE Hold = Hval;
+ 				Hval = C(0.0);
++				if (Hold == C(0.0)) continue; // dry: nothing to add to the mass balance
+ 
+ 				NUMERIC_TYPE Q = -Hold * cuda::geometry.dx * cuda::geometry.dy
+ 					/ cuda::dt;
+diff -ruN a/cuda/cuda_max_field.cu b/cuda/cuda_max_field.cu
+--- a/cuda/cuda_max_field.cu	2022-12-07 20:45:10
++++ b/cuda/cuda_max_field.cu	2026-10-08 21:46:09
+@@ -93,18 +93,9 @@
+ grid_size(grid_size),
+ precision(precision)
+ {
+-	if (acceleration) {
+-		maxH = GhostRaster::allocate_pinned_H(geometry); //// change to allocate_pinned_H()
+-		totalHtm = GhostRaster::allocate_pinned_H(geometry);
+-		maxHtm = GhostRaster::allocate_pinned_H(geometry);
+-		initHtm = GhostRaster::allocate_pinned_H(geometry);
+-	}
+-	else {
+-		maxH = GhostRaster::allocate_pinned(geometry); //// change to allocate_pinned_H()
+-		totalHtm = GhostRaster::allocate_pinned(geometry);
+-		maxHtm = GhostRaster::allocate_pinned(geometry);
+-		initHtm = GhostRaster::allocate_pinned(geometry);
+-	}
++	// device memory, padded like every grid the kernels index
++	maxH = GhostRaster::allocate_device(geometry);
++	cudaMemset(maxH, 0, lis::GhostRaster::elements(geometry)*sizeof(NUMERIC_TYPE));
+ }
+ 
+ void lis::cuda::MaxField::update
+@@ -130,13 +121,16 @@
+ 
+ 	FILE* file = fopen_or_die(filename, "wb");
+ 	
+-	AsciiRaster::write(file, maxH, geometry, pitch, offset, NULLVAL,0,
++	NUMERIC_TYPE* h_maxH = GhostRaster::allocate_pinned(geometry);
++	cuda::copy(h_maxH, maxH, lis::GhostRaster::elements(geometry)*sizeof(NUMERIC_TYPE));
++	AsciiRaster::write(file, h_maxH, geometry, pitch, offset, NULLVAL,0,
+ 			precision);
+ 
+ 	fclose(file);
++	free_pinned(h_maxH);
+ }
+ 
+ lis::cuda::MaxField::~MaxField()
+ {
+-	free_pinned(maxH);
++	free_device(maxH);
+ }
+diff -ruN a/cuda/dg2/cuda_dg2_solver.cu b/cuda/dg2/cuda_dg2_solver.cu
+--- a/cuda/dg2/cuda_dg2_solver.cu	2022-12-07 20:44:54
++++ b/cuda/dg2/cuda_dg2_solver.cu	2026-10-08 21:46:09
+@@ -266,9 +266,7 @@
+ 
+ 			__syncthreads();
+ 
+-			if (threadIdx.x == 0) continue;
+-
+-			if (i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
++			if (threadIdx.x != 0 && i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
+ 			{
+ 				FlowVector& F_w = F[threadIdx.y][threadIdx.x-1];
+ 				Ustar_pos = Ustar[threadIdx.y][threadIdx.x-1];
+@@ -284,6 +282,8 @@
+ 					Lx += bed_source_x(Ustar_0x.H, Ustar_1x.H, DEM, U_w, i, j);
+ 				U_out[j*cuda::pitch + i] = rk_op(i, j, Lx);
+ 			}
++			// shared memory is rewritten in the next pass: wait for every reader
++			__syncthreads();
+ 		}
+ 	}
+ }
+@@ -355,9 +355,7 @@
+ 
+ 			__syncthreads();
+ 
+-			if (threadIdx.y == 0) continue;
+-			
+-			if (i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
++			if (threadIdx.y != 0 && i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
+ 			{
+ 				FlowVector& F_n = F[threadIdx.y-1][threadIdx.x];
+ 				Ustar_neg = Ustar[threadIdx.y-1][threadIdx.x];
+@@ -374,6 +372,8 @@
+ 					Ly += bed_source_y(Ustar_0y.H, Ustar_1y.H, DEM, U_n, i, j);
+ 				U_out[j*cuda::pitch + i] = rk_op(i, j, Ly);
+ 			}
++			// shared memory is rewritten in the next pass: wait for every reader
++			__syncthreads();
+ 		}
+ 	}
+ }
+diff -ruN a/cuda/fv1/cuda_fv1_solver.cu b/cuda/fv1/cuda_fv1_solver.cu
+--- a/cuda/fv1/cuda_fv1_solver.cu	2022-12-07 20:45:10
++++ b/cuda/fv1/cuda_fv1_solver.cu	2026-10-08 21:46:09
+@@ -358,9 +358,7 @@
+ 
+ 			__syncthreads();
+ 
+-			if (threadIdx.x == 0) continue;
+-
+-			if (i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
++			if (threadIdx.x != 0 && i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
+ 			{
+ 				FlowVector& F_w = F[threadIdx.y][threadIdx.x-1];
+ 				FlowVector U0 = Uold[j*cuda::pitch + i];
+@@ -379,6 +377,8 @@
+ 				HV = U0.HV - cuda::dt * (F_e.HV - F_w.HV)/cuda::geometry.dx;
+ 
+ 			}
++			// shared memory is rewritten in the next pass: wait for every reader
++			__syncthreads();
+ 		}
+ 	}
+ }
+@@ -453,9 +453,7 @@
+ 
+                         __syncthreads();
+ 
+-                        if (threadIdx.y == 0) continue;
+-
+-			if (i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
++			if (threadIdx.y != 0 && i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
+ 			{
+ 				FlowVector& F_n = F[threadIdx.y-1][threadIdx.x];
+ 				FlowVector U0 = Uint[j*cuda::pitch + i];
+@@ -474,6 +472,8 @@
+ 					- bed_source_y(Zstar_s, Zstar_n, Ustar_pos.H, Hstar_n, ETA));
+ 			
+ 			}
++			// shared memory is rewritten in the next pass: wait for every reader
++			__syncthreads();
+         }
+     }
+ }
+diff -ruN a/cuda/fv2/cuda_fv2_solver.cu b/cuda/fv2/cuda_fv2_solver.cu
+--- a/cuda/fv2/cuda_fv2_solver.cu	2022-12-07 20:44:54
++++ b/cuda/fv2/cuda_fv2_solver.cu	2026-10-08 21:46:09
+@@ -225,9 +225,7 @@
+ 
+ 			__syncthreads();
+ 
+-			if (threadIdx.x == 0) continue;
+-
+-			if (i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
++			if (threadIdx.x != 0 && i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
+ 			{
+ 				FlowVector& F_w = F[threadIdx.y][threadIdx.x-1];
+ 				Ustar_pos = Ustar[threadIdx.y][threadIdx.x-1];
+@@ -240,6 +238,8 @@
+ 				Lx += bed_source_x(Ustar_0x.H, DEM, U_w, i, j);
+ 				U_out[j*cuda::pitch + i] = rk_op(i, j, Lx);
+ 			}
++			// shared memory is rewritten in the next pass: wait for every reader
++			__syncthreads();
+ 		}
+ 	}
+ }
+@@ -306,9 +306,7 @@
+ 
+ 			__syncthreads();
+ 
+-			if (threadIdx.y == 0) continue;
+-			
+-			if (i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
++			if (threadIdx.y != 0 && i <= cuda::geometry.xsz && j <= cuda::geometry.ysz)
+ 			{
+ 				FlowVector& F_n = F[threadIdx.y-1][threadIdx.x];
+ 				Ustar_neg = Ustar[threadIdx.y-1][threadIdx.x];
+@@ -321,6 +319,8 @@
+ 				Ly += bed_source_y(Ustar_0y.H, DEM, U_n, i, j);
+ 				U_out[j*cuda::pitch + i] = rk_op(i, j, Ly);
+ 			}
++			// shared memory is rewritten in the next pass: wait for every reader
++			__syncthreads();
+ 		}
+ 	}
+ }
+diff -ruN a/format b/format
+--- a/format	2022-12-07 20:44:54
++++ b/format	1970-01-01 01:00:00
+@@ -1 +0,0 @@
+-5
+diff -ruN a/lisflood.cpp b/lisflood.cpp
+--- a/lisflood.cpp	2022-12-13 20:18:44
++++ b/lisflood.cpp	2026-10-08 21:46:09
+@@ -27,6 +27,9 @@
+     #include "cuda/acc_nugrid/cuda_acc_nugrid_simulate.cuh"
+ 	#include "cuda/adaptive/cuda_adaptive_simulate.cuh"
+ #endif
++#ifdef METAL_ENABLED
++	#include "metal/metal_integrate.h"
++#endif
+ 
+ #include "lisflood2/file_tool.h"
+ 
+@@ -774,6 +777,13 @@
+ 	}
+ 	else if (Statesptr->fv1 == ON)
+ 	{
++#ifdef METAL_ENABLED
++		// GPU requested (cuda or metal keyword) on an Apple Silicon Mac
++		if (Statesptr->cuda == ON && metal_is_available())
++			run_metal_fv1(*Fnameptr, &Fps, *Statesptr, *Parptr, *Solverptr, *BCptr,
++					*Stageptr, *Arrptr, verbosemode);
++		else
++#endif
+ 		fv1::solve(Fnameptr, &Fps, Statesptr, Parptr, Solverptr, BCptr,
+ 				Stageptr, Arrptr, verbosemode);
+ 	}
+@@ -846,7 +856,7 @@
+ // printout header with program and version number
+ {
+   printf("***************************\n");
+-  printf(" LISFLOOD-FP version %d.%d.%d (%s)\n", LF_VersionMajor, LF_VersionMinor, LF_VersionInc, NUMERIC_TYPE_NAME);
++  printf(" LISFLOOD-FP %s\n", LF_Release);
+   if (verbose == ON)
+   {
+ #if defined (__INTEL_COMPILER)
+diff -ruN a/metal/CMakeLists.txt b/metal/CMakeLists.txt
+--- a/metal/CMakeLists.txt	1970-01-01 01:00:00
++++ b/metal/CMakeLists.txt	2026-10-08 21:46:09
+@@ -0,0 +1,35 @@
++# Metal GPU back end for the FV1 solver (Apple Silicon)
++
++find_library(METAL_FRAMEWORK Metal)
++find_library(FOUNDATION_FRAMEWORK Foundation)
++
++if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
++    # The kernels are compiled to a metallib next to the executable, which loads
++    # it at run time. -fno-fast-math keeps the GPU arithmetic identical to the
++    # CPU solver's, so the verification cases are bit-for-bit reproducible.
++    set(METALLIB ${CMAKE_BINARY_DIR}/metal_fv1_kernels.metallib)
++    add_custom_command(
++        OUTPUT ${METALLIB}
++        COMMAND xcrun -sdk macosx metal -fno-fast-math
++                -c ${CMAKE_CURRENT_SOURCE_DIR}/fv1/metal_fv1_kernels.metal
++                -o ${CMAKE_BINARY_DIR}/metal_fv1_kernels.air
++        COMMAND xcrun -sdk macosx metallib ${CMAKE_BINARY_DIR}/metal_fv1_kernels.air
++                -o ${METALLIB}
++        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/fv1/metal_fv1_kernels.metal
++        COMMENT "Compiling Metal FV1 kernels")
++    add_custom_target(metal_shaders DEPENDS ${METALLIB})
++
++    add_library(lisflood-metal STATIC
++        ${CMAKE_CURRENT_SOURCE_DIR}/metal_integrate.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/fv1/metal_fv1_simulate.mm)
++    add_dependencies(lisflood-metal metal_shaders)
++    target_include_directories(lisflood-metal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR})
++    target_link_libraries(lisflood-metal PUBLIC ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} lisflood-base)
++    target_compile_options(lisflood-metal PRIVATE -fobjc-arc)
++    target_compile_definitions(lisflood-metal PUBLIC METAL_ENABLED)
++
++    set(METAL_ENABLED TRUE PARENT_SCOPE)
++    set(METAL_LIBRARY lisflood-metal PARENT_SCOPE)
++else()
++    message(WARNING "Metal framework not found: building without the Metal back end")
++endif()
+diff -ruN a/metal/fv1/metal_fv1_kernels.metal b/metal/fv1/metal_fv1_kernels.metal
+--- a/metal/fv1/metal_fv1_kernels.metal	1970-01-01 01:00:00
++++ b/metal/fv1/metal_fv1_kernels.metal	2026-10-08 21:46:09
+@@ -0,0 +1,991 @@
++//
++// LISFLOOD-FP Metal FV1 Solver Kernels
++// Ported from CUDA implementation
++// Same numerical algorithm - different GPU language
++//
++
++#include <metal_stdlib>
++using namespace metal;
++
++// Constants matching LISFLOOD-FP definitions
++#define DEPTH_THRESH 1e-3f
++#define MIN_SAFE_H 1e-6f  // Minimum depth for safe division (1 micron)
++
++// Portable atomic add for floats (works on any Metal version that supports atomic_uint)
++inline void atomic_add_float(device atomic_uint* addr, float val) {
++    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
++    while (true) {
++        float f_expected = as_type<float>(expected);
++        float f_new = f_expected + val;
++        uint desired = as_type<uint>(f_new);
++        if (atomic_compare_exchange_weak_explicit(addr, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {
++            break;
++        }
++    }
++}
++
++inline void account_boundary(device atomic_uint* totals, float outward_volume) {
++    if (outward_volume > 0.0f) atomic_add_float(&totals[0], outward_volume);
++    else if (outward_volume < 0.0f) atomic_add_float(&totals[1], -outward_volume);
++}
++
++// Boundary types matching ESourceType in lisflood.h
++enum ENUM_BC_TYPE {
++    BC_NONE = 0,   // closed / reflective
++    BC_FREE = 1,   // transmissive
++    BC_HFIX = 2,   // fixed water surface elevation
++    BC_HVAR = 3,   // time-varying water surface elevation
++    BC_QFIX = 4,   // fixed unit discharge (m2/s)
++    BC_QVAR = 5,   // time-varying unit discharge (m2/s)
++    BC_FREE6 = 6   // transmissive (alternate code)
++};
++
++// A boundary state split into the component normal to the edge and the one
++// tangential to it, so the same routine serves both sweeps (the CPU does the
++// same thing by swapping HU/HV in the argument list for the y boundaries).
++struct EdgeState {
++    float H;
++    float Qn;  // momentum normal to the boundary
++    float Qt;  // momentum tangential to the boundary
++};
++
++// Mirrors fv1::set_boundary_values() in swe/fv1.cpp.
++//
++// `in` is the interior cell's reconstructed state at the edge and `out` the
++// state outside it; both may be modified, because the prescribed-discharge
++// types also constrain the inside (the CPU does exactly this). `qn_sign` is +1
++// where a positive prescribed discharge drives flow along this axis' positive
++// direction and -1 where it opposes it, so that a positive BC value always
++// means inflow on every edge.
++inline void set_boundary_values(int type, float value, float Z,
++                                float depth_thresh, float qn_sign,
++                                thread EdgeState& in, thread EdgeState& out)
++{
++    if (type == BC_HFIX || type == BC_HVAR) {
++        out.H = max(0.0f, value - Z);
++        out.Qn = in.Qn;
++        out.Qt = in.Qt;
++    } else if (type == BC_QFIX || type == BC_QVAR) {
++        out.Qn = qn_sign * value;
++        if (abs(out.Qn) > 1e-12f) {
++            in.H = max(in.H, 1.1f * depth_thresh);
++            out.H = in.H;
++        } else {
++            out.H = in.H;
++        }
++        in.Qn = out.Qn;
++        out.Qt = in.Qt;
++    } else if (type == BC_FREE || type == BC_FREE6) {
++        out.H = in.H;
++        out.Qn = in.Qn;
++        out.Qt = in.Qt;
++    } else { // BC_NONE: closed wall
++        out.H = in.H;
++        out.Qn = -in.Qn;
++        out.Qt = in.Qt;
++    }
++}
++
++// Geometry parameters (set from host)
++struct Geometry {
++    int xsz;
++    int ysz;
++    int pitch;
++    float dx;
++    float dy;
++    float tly;
++    float blx;
++    float bly;
++};
++
++// Physical parameters
++struct PhysicalParams {
++    float g;           // gravity
++    float manning;     // Manning's n
++    float speed_thresh;
++};
++
++// Solver parameters
++struct SolverParams {
++    float dt;
++    float depth_thresh;
++};
++
++// Flow vector structure
++struct FlowVector {
++    float H;   // water height
++    float HU;  // x-momentum
++    float HV;  // y-momentum
++};
++
++// HLL Riemann solver in x-direction
++inline FlowVector hll_x(FlowVector U_neg, FlowVector U_pos, float g, float depth_thresh) {
++    float H_neg = max(U_neg.H, 0.0f);
++    float H_pos = max(U_pos.H, 0.0f);
++    
++    if (H_neg <= depth_thresh && H_pos <= depth_thresh) {
++        return FlowVector{0.0f, 0.0f, 0.0f};
++    }
++
++    float u_neg = (H_neg > depth_thresh) ? U_neg.HU / max(H_neg, 1e-6f) : 0.0f;
++    float v_neg = (H_neg > depth_thresh) ? U_neg.HV / max(H_neg, 1e-6f) : 0.0f;
++    float u_pos = (H_pos > depth_thresh) ? U_pos.HU / max(H_pos, 1e-6f) : 0.0f;
++    float v_pos = (H_pos > depth_thresh) ? U_pos.HV / max(H_pos, 1e-6f) : 0.0f;
++    
++    float a_neg = sqrt(g * H_neg);
++    float a_pos = sqrt(g * H_pos);
++    
++    // Toro estimate for H_star, U_star (matching hll_include.h)
++    float h_star = pow(0.5f*(a_neg + a_pos) + 0.25f*(u_neg - u_pos), 2.0f) / g;
++    float u_star = 0.5f*(u_neg + u_pos) + a_neg - a_pos;
++    float a_star = sqrt(g * h_star);
++
++    float s_neg, s_pos;
++    if (H_neg <= depth_thresh) {
++        s_neg = u_pos - 2.0f*a_pos;
++    } else {
++        s_neg = min(u_neg - a_neg, u_star - a_star);
++    }
++
++    if (H_pos <= depth_thresh) {
++        s_pos = u_neg + 2.0f*a_neg;
++    } else {
++        s_pos = max(u_pos + a_pos, u_star + a_star);
++    }
++    
++    s_neg = min(s_neg, 0.0f);
++    s_pos = max(s_pos, 0.0f);
++    
++    FlowVector F_neg = {
++        U_neg.HU,
++        u_neg*U_neg.HU + 0.5f * g * H_neg * H_neg,
++        U_neg.HV * u_neg
++    };
++    
++    FlowVector F_pos = {
++        U_pos.HU,
++        u_pos*U_pos.HU + 0.5f * g * H_pos * H_pos,
++        U_pos.HV * u_pos
++    };
++    
++    float denom = s_pos - s_neg;
++    if (abs(denom) < 1e-10f) return FlowVector{0.0f, 0.0f, 0.0f};
++    
++    FlowVector F;
++    if (s_neg >= 0.0f) {
++        F = F_neg;
++    } else if (s_pos <= 0.0f) {
++        F = F_pos;
++    } else {
++        F.H = (s_pos * F_neg.H - s_neg * F_pos.H + s_pos * s_neg * (U_pos.H - U_neg.H)) / denom;
++        F.HU = (s_pos * F_neg.HU - s_neg * F_pos.HU + s_pos * s_neg * (U_pos.HU - U_neg.HU)) / denom;
++        
++        // Transverse momentum flux (HV) using S_mid logic from hll_include.h
++        float s_mid = (s_neg * H_pos * (u_pos - s_pos) - s_pos * H_neg * (u_neg - s_neg)) 
++                    / (H_pos * (u_pos - s_pos) - H_neg * (u_neg - s_neg));
++        
++        if (s_mid >= 0.0f) {
++            F.HV = F.H * v_neg;
++        } else {
++            F.HV = F.H * v_pos;
++        }
++    }
++    
++    return F;
++}
++
++// HLL Riemann solver in y-direction
++inline FlowVector hll_y(FlowVector U_neg, FlowVector U_pos, float g, float depth_thresh) {
++    float H_neg = max(U_neg.H, 0.0f);
++    float H_pos = max(U_pos.H, 0.0f);
++    
++    if (H_neg <= depth_thresh && H_pos <= depth_thresh) {
++        return FlowVector{0.0f, 0.0f, 0.0f};
++    }
++
++    float u_neg = (H_neg > depth_thresh) ? U_neg.HU / max(H_neg, 1e-6f) : 0.0f;
++    float v_neg = (H_neg > depth_thresh) ? U_neg.HV / max(H_neg, 1e-6f) : 0.0f;
++    float u_pos = (H_pos > depth_thresh) ? U_pos.HU / max(H_pos, 1e-6f) : 0.0f;
++    float v_pos = (H_pos > depth_thresh) ? U_pos.HV / max(H_pos, 1e-6f) : 0.0f;
++    
++    float a_neg = sqrt(g * H_neg);
++    float a_pos = sqrt(g * H_pos);
++    
++    // Toro estimate for H_star, V_star (matching hll_include.h with V as primary)
++    float h_star = pow(0.5f*(a_neg + a_pos) + 0.25f*(v_neg - v_pos), 2.0f) / g;
++    float v_star = 0.5f*(v_neg + v_pos) + a_neg - a_pos;
++    float a_star = sqrt(g * h_star);
++
++    float s_neg, s_pos;
++    if (H_neg <= depth_thresh) {
++        s_neg = v_pos - 2.0f*a_pos;
++    } else {
++        s_neg = min(v_neg - a_neg, v_star - a_star);
++    }
++
++    if (H_pos <= depth_thresh) {
++        s_pos = v_neg + 2.0f*a_neg;
++    } else {
++        s_pos = max(v_pos + a_pos, v_star + a_star);
++    }
++    
++    s_neg = min(s_neg, 0.0f);
++    s_pos = max(s_pos, 0.0f);
++    
++    FlowVector F_neg = {
++        U_neg.HV,
++        U_neg.HU * v_neg,
++        v_neg * U_neg.HV + 0.5f * g * H_neg * H_neg
++    };
++    
++    FlowVector F_pos = {
++        U_pos.HV,
++        U_pos.HU * v_pos,
++        v_pos * U_pos.HV + 0.5f * g * H_pos * H_pos
++    };
++    
++    float denom = s_pos - s_neg;
++    if (abs(denom) < 1e-10f) return FlowVector{0.0f, 0.0f, 0.0f};
++    
++    FlowVector F;
++    if (s_neg >= 0.0f) {
++        F = F_neg;
++    } else if (s_pos <= 0.0f) {
++        F = F_pos;
++    } else {
++        F.H = (s_pos * F_neg.H - s_neg * F_pos.H + s_pos * s_neg * (U_pos.H - U_neg.H)) / denom;
++        F.HV = (s_pos * F_neg.HV - s_neg * F_pos.HV + s_pos * s_neg * (U_pos.HV - U_neg.HV)) / denom;
++        
++        // Transverse momentum flux (HU in y-direction) using S_mid logic
++        float s_mid = (s_neg * H_pos * (v_pos - s_pos) - s_pos * H_neg * (v_neg - s_neg)) 
++                    / (H_pos * (v_pos - s_pos) - H_neg * (v_neg - s_neg));
++        
++        if (s_mid >= 0.0f) {
++            F.HU = F.H * u_neg;
++        } else {
++            F.HU = F.H * u_pos;
++        }
++    }
++    
++    return F;
++}
++
++// Bed source term for x-direction
++inline float bed_source_x(float Zstar_w, float Zstar_e, float Hstar_w, float Hstar_e, float ETA, float g, float dx) {
++    float Zdagger_w = Zstar_w - max(0.0f, -(ETA - Zstar_w));
++    float Zdagger_e = Zstar_e - max(0.0f, -(ETA - Zstar_e));
++    return -g * 0.5f * (Hstar_w + Hstar_e) * (Zdagger_e - Zdagger_w) / dx;
++}
++
++// Bed source term for y-direction
++inline float bed_source_y(float Zstar_n, float Zstar_s, float Hstar_n, float Hstar_s, float ETA, float g, float dy) {
++    float Zdagger_n = Zstar_n - max(0.0f, -(ETA - Zstar_n));
++    float Zdagger_s = Zstar_s - max(0.0f, -(ETA - Zstar_s));
++    return -g * 0.5f * (Hstar_n + Hstar_s) * (Zdagger_s - Zdagger_n) / dy;
++}
++
++// Apply friction (Manning's equation)
++kernel void apply_friction(
++    device float* H [[buffer(0)]],
++    device float* HU [[buffer(1)]],
++    device float* HV [[buffer(2)]],
++    constant Geometry& geom [[buffer(3)]],
++    constant PhysicalParams& params [[buffer(4)]],
++    constant SolverParams& solver [[buffer(5)]],
++    device const float* manning [[buffer(6)]],
++    uint2 gid [[thread_position_in_grid]])
++{
++    int i = gid.x + 1;
++    int j = gid.y + 1;
++    
++    if (i > geom.xsz || j > geom.ysz) return;
++    
++    int idx = j * geom.pitch + i;
++    float h = H[idx];
++    
++    if (h > solver.depth_thresh) {
++        float hu = HU[idx];
++        float hv = HV[idx];
++        
++        // Use safe depth for division to prevent numerical instability
++        float h_safe = max(h, MIN_SAFE_H);
++        
++        float n = (manning != nullptr) ? manning[idx] : params.manning;
++        float u = hu / h_safe;
++        float v = hv / h_safe;
++        float speed = sqrt(u * u + v * v);
++        float Cf = params.g * n * n / pow(h_safe, 0.33333333f);
++
++        // Speed threshold - zero out momentum for very slow flow (matches fv1.cpp)
++        if (abs(u) <= params.speed_thresh && abs(v) <= params.speed_thresh) {
++            HU[idx] = 0.0f;
++            HV[idx] = 0.0f;
++            return;
++        }
++        
++        // CPU semi-implicit friction (fv1.cpp lines 117-128)
++        // The CPU uses: HU_new = HU_old + dt * Sf / D
++        // where Sf = -Cf * u * speed and D = 1 + dt*Cf/h * directional_term
++        float speed_safe = speed + 1e-12f; // Very small epsilon
++        float denom_x = 1.0f + solver.dt * Cf / h_safe * (2.0f * u * u + v * v) / speed_safe;
++        float denom_y = 1.0f + solver.dt * Cf / h_safe * (u * u + 2.0f * v * v) / speed_safe;
++        
++        float Sf_x = -Cf * u * speed;
++        float Sf_y = -Cf * v * speed;
++        
++        HU[idx] = hu + solver.dt * Sf_x / denom_x;
++        HV[idx] = hv + solver.dt * Sf_y / denom_y;
++        
++    } else {
++        HU[idx] = 0.0f;
++        HV[idx] = 0.0f;
++    }
++}
++
++// Compute Z* at cell interfaces in x-direction
++kernel void compute_zstar_x(
++    device const float* DEM [[buffer(0)]],
++    device float* Zstar_x [[buffer(1)]],
++    constant Geometry& geom [[buffer(2)]],
++    uint2 gid [[thread_position_in_grid]])
++{
++    int i = gid.x;
++    int j = gid.y + 1;
++    
++    if (i > geom.xsz || j > geom.ysz) return;
++    
++    int idx = j * geom.pitch + i;
++    float Z_neg = DEM[idx];
++    float Z_pos = DEM[idx + 1];
++    
++    Zstar_x[idx] = max(Z_neg, Z_pos);
++}
++
++// Compute Z* at cell interfaces in y-direction
++kernel void compute_zstar_y(
++    device const float* DEM [[buffer(0)]],
++    device float* Zstar_y [[buffer(1)]],
++    constant Geometry& geom [[buffer(2)]],
++    uint2 gid [[thread_position_in_grid]])
++{
++    int i = gid.x + 1;
++    int j = gid.y;
++    
++    if (i > geom.xsz || j > geom.ysz) return;
++    
++    int idx = j * geom.pitch + i;
++    float Z_neg = DEM[idx];         // North cell (row j)
++    float Z_pos = DEM[(j+1) * geom.pitch + i]; // South cell (row j+1)
++    
++    Zstar_y[idx] = max(Z_neg, Z_pos);
++}
++
++// Threadgroup tile for the flux-sharing sweeps. Must match the host dispatch.
++#define TG_X 16
++#define TG_Y 16
++
++// Reconstruct a cell's state at one interface (the "star" state).
++inline FlowVector star_state(FlowVector U, float Z, float Zstar, float depth_thresh) {
++    float u = (U.H > depth_thresh) ? U.HU / max(U.H, 1e-6f) : 0.0f;
++    float v = (U.H > depth_thresh) ? U.HV / max(U.H, 1e-6f) : 0.0f;
++    FlowVector S;
++    S.H = max(0.0f, U.H + Z - Zstar);
++    S.HU = S.H * u;
++    S.HV = S.H * v;
++    return S;
++}
++
++// Update flow variables in x-direction.
++//
++// Each thread evaluates exactly ONE interface flux (the interface between cell
++// i and cell i+1) and publishes it to threadgroup memory; cell i then reads its
++// west flux back as the *same bits* its neighbour computed. This mirrors
++// cuda/fv1/cuda_fv1_solver.cu, and it is what makes the scheme conservative:
++// evaluating the same interface independently in both adjacent cells is only
++// algebraically equal, not bitwise equal, so the water leaving one cell did not
++// match the water entering the next and the domain leaked mass.
++// Threadgroups overlap by one column in x so every interface is covered;
++// threads with tid.x == 0 contribute a flux but update no cell.
++kernel void update_flow_x(
++    device const float* H_old [[buffer(0)]],
++    device const float* HU_old [[buffer(1)]],
++    device const float* HV_old [[buffer(2)]],
++    device float* H_new [[buffer(3)]],
++    device float* HU_new [[buffer(4)]],
++    device float* HV_new [[buffer(5)]],
++    device const float* DEM [[buffer(6)]],
++    device const float* Zstar_x [[buffer(7)]],
++    constant Geometry& geom [[buffer(8)]],
++    constant PhysicalParams& params [[buffer(9)]],
++    constant SolverParams& solver [[buffer(10)]],
++    device const int* boundary_types [[buffer(11)]],
++    device const float* boundary_values [[buffer(12)]],
++    device atomic_uint* mass_totals [[buffer(13)]],
++    uint2 tgid [[threadgroup_position_in_grid]],
++    uint2 tid [[thread_position_in_threadgroup]])
++{
++    threadgroup FlowVector F[TG_Y][TG_X];
++    threadgroup float Hstar_sh[TG_Y][TG_X];
++
++    int i = (int)(tgid.x * (TG_X - 1) + tid.x);   // interface / cell index 0..xsz
++    int j = (int)(tgid.y * TG_Y + tid.y) + 1;     // row 1..ysz
++
++    bool active = (i <= geom.xsz && j <= geom.ysz);
++
++    FlowVector U_c, Ustar_c_e;
++    float Z_c = 0.0f, Zstar_e = 0.0f;
++    FlowVector F_e = FlowVector{0.0f, 0.0f, 0.0f};
++
++    if (active) {
++        int idx = j * geom.pitch + i;
++        Zstar_e = Zstar_x[idx];
++
++        Z_c = DEM[idx];
++        U_c = FlowVector{H_old[idx], HU_old[idx], HV_old[idx]};
++        Ustar_c_e = star_state(U_c, Z_c, Zstar_e, solver.depth_thresh);
++
++        float Z_e = DEM[idx + 1];
++        FlowVector U_e = FlowVector{H_old[idx + 1], HU_old[idx + 1], HV_old[idx + 1]};
++        FlowVector Ustar_e = star_state(U_e, Z_e, Zstar_e, solver.depth_thresh);
++
++        // Domain edges: replace the ghost-cell state with the prescribed
++        // boundary condition. At i == 0 the outside state is Ustar_c_e (the
++        // west ghost) and the interior is Ustar_e; at i == xsz it is the other
++        // way round.
++        if (i == 0 || i == geom.xsz) {
++            bool west = (i == 0);
++            int bc_idx = west ? (2 * geom.xsz + 2 * geom.ysz - (j - 1) - 1)
++                              : (geom.xsz + (j - 1));
++            int type = boundary_types[bc_idx];
++            float value = boundary_values[bc_idx];
++            float Z_in = west ? Z_e : Z_c;   // interior cell's bed elevation
++
++            EdgeState in_s, out_s;
++            if (west) {
++                in_s = EdgeState{Ustar_e.H, Ustar_e.HU, Ustar_e.HV};
++                out_s = EdgeState{Ustar_c_e.H, Ustar_c_e.HU, Ustar_c_e.HV};
++            } else {
++                in_s = EdgeState{Ustar_c_e.H, Ustar_c_e.HU, Ustar_c_e.HV};
++                out_s = EdgeState{Ustar_e.H, Ustar_e.HU, Ustar_e.HV};
++            }
++            set_boundary_values(type, value, Z_in, solver.depth_thresh,
++                                west ? 1.0f : -1.0f, in_s, out_s);
++            if (west) {
++                Ustar_e = FlowVector{in_s.H, in_s.Qn, in_s.Qt};
++                Ustar_c_e = FlowVector{out_s.H, out_s.Qn, out_s.Qt};
++            } else {
++                Ustar_c_e = FlowVector{in_s.H, in_s.Qn, in_s.Qt};
++                Ustar_e = FlowVector{out_s.H, out_s.Qn, out_s.Qt};
++            }
++        }
++
++        F_e = hll_x(Ustar_c_e, Ustar_e, params.g, solver.depth_thresh);
++
++        F[tid.y][tid.x] = F_e;
++        Hstar_sh[tid.y][tid.x] = Ustar_e.H;
++
++        // Domain-edge bookkeeping: i == 0 is the west face, i == xsz the east.
++        if (i == 0) account_boundary(mass_totals, -F_e.H * solver.dt * geom.dy);
++        if (i == geom.xsz) account_boundary(mass_totals, F_e.H * solver.dt * geom.dy);
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    if (tid.x == 0 || !active || i < 1) return;
++
++    int idx = j * geom.pitch + i;
++    FlowVector F_w = F[tid.y][tid.x - 1];
++    float Hstar_w = Hstar_sh[tid.y][tid.x - 1];
++    float Zstar_w = Zstar_x[idx - 1];
++
++    float ETA = U_c.H + Z_c;
++    float bed_src = bed_source_x(Zstar_w, Zstar_e, Hstar_w, Ustar_c_e.H, ETA,
++                                 params.g, geom.dx);
++
++    // Partial (x-only) contribution of the unsplit FV1 update. No clamping and
++    // no momentum zeroing here: update_flow_y still has to add the y-direction
++    // divergence to this intermediate state.
++    H_new[idx] = U_c.H - solver.dt * (F_e.H - F_w.H) / geom.dx;
++    HU_new[idx] = U_c.HU - solver.dt * ((F_e.HU - F_w.HU) / geom.dx - bed_src);
++    HV_new[idx] = U_c.HV - solver.dt * (F_e.HV - F_w.HV) / geom.dx;
++}
++
++// Update flow variables in y-direction (same flux-sharing scheme, overlapping
++// in y). Metal's y axis points south (+j), so a thread at row j evaluates the
++// interface between rows j and j+1 -- its own south face -- and cell j reads its
++// north flux back from the thread above it.
++kernel void update_flow_y(
++    device const float* H_int [[buffer(0)]],
++    device const float* HU_int [[buffer(1)]],
++    device const float* HV_int [[buffer(2)]],
++    device const float* H_old [[buffer(3)]],
++    device const float* HU_old [[buffer(4)]],
++    device const float* HV_old [[buffer(5)]],
++    device float* H_new [[buffer(6)]],
++    device float* HU_new [[buffer(7)]],
++    device float* HV_new [[buffer(8)]],
++    device const float* DEM [[buffer(9)]],
++    device const float* Zstar_y [[buffer(10)]],
++    constant Geometry& geom [[buffer(11)]],
++    constant PhysicalParams& params [[buffer(12)]],
++    constant SolverParams& solver [[buffer(13)]],
++    device const int* boundary_types [[buffer(14)]],
++    device const float* boundary_values [[buffer(15)]],
++    device atomic_uint* mass_totals [[buffer(16)]],
++    uint2 tgid [[threadgroup_position_in_grid]],
++    uint2 tid [[thread_position_in_threadgroup]])
++{
++    threadgroup FlowVector F[TG_Y][TG_X];
++    threadgroup float Hstar_sh[TG_Y][TG_X];
++
++    int i = (int)(tgid.x * TG_X + tid.x) + 1;     // column 1..xsz
++    int j = (int)(tgid.y * (TG_Y - 1) + tid.y);   // interface / cell row 0..ysz
++
++    bool active = (i <= geom.xsz && j <= geom.ysz);
++
++    FlowVector U_c, Ustar_c_s;
++    float Z_c = 0.0f, Zstar_s = 0.0f;
++    FlowVector F_s = FlowVector{0.0f, 0.0f, 0.0f};
++
++    if (active) {
++        int idx = j * geom.pitch + i;
++        Zstar_s = Zstar_y[idx];
++
++        Z_c = DEM[idx];
++        U_c = FlowVector{H_old[idx], HU_old[idx], HV_old[idx]};
++        Ustar_c_s = star_state(U_c, Z_c, Zstar_s, solver.depth_thresh);
++
++        int idx_s = (j + 1) * geom.pitch + i;
++        float Z_s = DEM[idx_s];
++        FlowVector U_s = FlowVector{H_old[idx_s], HU_old[idx_s], HV_old[idx_s]};
++        FlowVector Ustar_s = star_state(U_s, Z_s, Zstar_s, solver.depth_thresh);
++
++        // Domain edges. Metal's y axis points south, so a positive prescribed
++        // discharge is +Qn on the north edge and -Qn on the south edge; that
++        // keeps "positive value == inflow" on every side, as on the CPU.
++        if (j == 0 || j == geom.ysz) {
++            bool north = (j == 0);
++            int bc_idx = north ? (i - 1)
++                               : (2 * geom.xsz + geom.ysz - (i - 1) - 1);
++            int type = boundary_types[bc_idx];
++            float value = boundary_values[bc_idx];
++            float Z_in = north ? Z_s : Z_c;
++
++            EdgeState in_s, out_s;
++            if (north) {
++                in_s = EdgeState{Ustar_s.H, Ustar_s.HV, Ustar_s.HU};
++                out_s = EdgeState{Ustar_c_s.H, Ustar_c_s.HV, Ustar_c_s.HU};
++            } else {
++                in_s = EdgeState{Ustar_c_s.H, Ustar_c_s.HV, Ustar_c_s.HU};
++                out_s = EdgeState{Ustar_s.H, Ustar_s.HV, Ustar_s.HU};
++            }
++            set_boundary_values(type, value, Z_in, solver.depth_thresh,
++                                north ? 1.0f : -1.0f, in_s, out_s);
++            if (north) {
++                Ustar_s = FlowVector{in_s.H, in_s.Qt, in_s.Qn};
++                Ustar_c_s = FlowVector{out_s.H, out_s.Qt, out_s.Qn};
++            } else {
++                Ustar_c_s = FlowVector{in_s.H, in_s.Qt, in_s.Qn};
++                Ustar_s = FlowVector{out_s.H, out_s.Qt, out_s.Qn};
++            }
++        }
++
++        F_s = hll_y(Ustar_c_s, Ustar_s, params.g, solver.depth_thresh);
++
++        F[tid.y][tid.x] = F_s;
++        Hstar_sh[tid.y][tid.x] = Ustar_s.H;
++
++        if (j == 0) account_boundary(mass_totals, -F_s.H * solver.dt * geom.dx);
++        if (j == geom.ysz) account_boundary(mass_totals, F_s.H * solver.dt * geom.dx);
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    if (tid.y == 0 || !active || j < 1) return;
++
++    int idx = j * geom.pitch + i;
++    FlowVector F_n = F[tid.y - 1][tid.x];
++    float Hstar_n = Hstar_sh[tid.y - 1][tid.x];
++    float Zstar_n = Zstar_y[(j - 1) * geom.pitch + i];
++
++    float ETA = U_c.H + Z_c;
++    float bed_src = bed_source_y(Zstar_n, Zstar_s, Hstar_n, Ustar_c_s.H, ETA,
++                                 params.g, geom.dy);
++
++    float h_next = max(0.0f, H_int[idx] - solver.dt * (F_s.H - F_n.H) / geom.dy);
++    float hu_next = HU_int[idx] - solver.dt * (F_s.HU - F_n.HU) / geom.dy;
++    float hv_next = HV_int[idx] - solver.dt * ((F_s.HV - F_n.HV) / geom.dy - bed_src);
++
++    // No "h <= depth_thresh => zero momentum" here: the CPU reference drops the
++    // momentum of shallow cells in apply_friction, which runs after rainfall and
++    // the point sources have topped the cell up.
++    H_new[idx] = h_next;
++    HU_new[idx] = hu_next;
++    HV_new[idx] = hv_next;
++}
++
++// Compute CFL timestep per cell (for adaptive timestepping)
++kernel void compute_dt_per_cell(
++    device const float* H [[buffer(0)]],
++    device const float* HU [[buffer(1)]],
++    device const float* HV [[buffer(2)]],
++    device float* dt_field [[buffer(3)]],
++    constant Geometry& geom [[buffer(4)]],
++    constant PhysicalParams& params [[buffer(5)]],
++    constant float& cfl [[buffer(6)]],
++    constant float& max_dt [[buffer(7)]],
++    volatile device atomic_uint* min_dt_atomic [[buffer(8)]],
++    uint2 gid [[thread_position_in_grid]])
++{
++    int i = gid.x + 1;
++    int j = gid.y + 1;
++    
++    if (i > geom.xsz || j > geom.ysz) return;
++    
++    int idx = j * geom.pitch + i;
++    float h = H[idx];
++    
++    if (h > DEPTH_THRESH) {
++        float hu = HU[idx];
++        float hv = HV[idx];
++        
++        // Use safe depth for division to prevent numerical instability
++        float h_safe = max(h, MIN_SAFE_H);
++        float u = hu / h_safe;
++        float v = hv / h_safe;
++        float c = sqrt(params.g * h);
++        
++        float dt_x = geom.dx / (abs(u) + c);
++        float dt_y = geom.dy / (abs(v) + c);
++        
++        dt_field[idx] = cfl * min(dt_x, dt_y);
++    } else {
++        dt_field[idx] = max_dt;
++    }
++    
++    // Global reduction using SIMD and Atomics
++    float local_dt = dt_field[idx];
++    
++    // SIMD reduction within warp/subgroup to reduce contention
++    // Make sure to include metal_simdgroup if needed, but it's standard
++    local_dt = simd_min(local_dt);
++    
++    if (simd_is_first()) {
++        uint dt_uint = as_type<uint>(local_dt);
++        atomic_fetch_min_explicit(min_dt_atomic, dt_uint, memory_order_relaxed);
++    }
++}
++
++// Zero ghost cells (boundary)
++kernel void zero_ghost_cells(
++    device float* H [[buffer(0)]],
++    device float* HU [[buffer(1)]],
++    device float* HV [[buffer(2)]],
++    constant Geometry& geom [[buffer(3)]],
++    uint gid [[thread_position_in_grid]])
++{
++    // North and South boundaries
++    if (gid < (uint)geom.pitch) {
++        int i = gid;
++        // North (j=0)
++        H[i] = 0.0f;
++        HU[i] = 0.0f;
++        HV[i] = 0.0f;
++        // South (j=ysz+1)
++        int idx_s = (geom.ysz + 1) * geom.pitch + i;
++        H[idx_s] = 0.0f;
++        HU[idx_s] = 0.0f;
++        HV[idx_s] = 0.0f;
++    }
++    
++    // East and West boundaries
++    if (gid < (uint)(geom.ysz + 2)) {
++        int j = gid;
++        // West (i=0)
++        int idx_w = j * geom.pitch;
++        H[idx_w] = 0.0f;
++        HU[idx_w] = 0.0f;
++        HV[idx_w] = 0.0f;
++        // East (i=xsz+1)
++        int idx_e = j * geom.pitch + geom.xsz + 1;
++        H[idx_e] = 0.0f;
++        HU[idx_e] = 0.0f;
++        HV[idx_e] = 0.0f;
++    }
++}
++
++// Apply uniform rainfall
++kernel void apply_uniform_rain(
++    device float* H [[buffer(0)]],
++    device const float* DEM [[buffer(1)]],
++    constant Geometry& geom [[buffer(2)]],
++    constant float& rain_rate [[buffer(3)]],
++    constant float& dt [[buffer(4)]],
++    constant float& nodata [[buffer(5)]],
++    device atomic_uint* mass_totals [[buffer(6)]],
++    uint2 gid [[thread_position_in_grid]])
++{
++    int i = gid.x + 1;
++    int j = gid.y + 1;
++    
++    if (i > geom.xsz || j > geom.ysz) return;
++    
++    int idx = j * geom.pitch + i;
++    float z = DEM[idx];
++    
++    // Don't add rain to nodata cells
++    if (abs(z - nodata) > 1e-6f) {
++        float increment = max(-H[idx], rain_rate * dt);
++        H[idx] += increment;
++        // Slot 3 is signed uniform-rain volume; negative rainfall is limited
++        // by the water present, so accounting must use the applied increment.
++        if (increment != 0.0f)
++            atomic_add_float(&mass_totals[3], increment * geom.dx * geom.dy);
++    }
++}
++
++// Helper for apply_rain (Dynamic)
++float rate_at_cell(device const float* rain_data, 
++                   int i, int j, 
++                   constant Geometry& dem_geom, 
++                   constant Geometry& rain_geom) 
++{
++    // i, j are 0-based DEM cell indices (inner domain)
++    
++    float x_offset = dem_geom.blx - rain_geom.blx;
++    float tile_i_f = (x_offset + (float)i * dem_geom.dx) / rain_geom.dx;
++    int tile_i = (int)floor(tile_i_f);
++    
++    float top_gap = dem_geom.tly - rain_geom.tly;
++    float tile_j_f = ((float)j - top_gap/dem_geom.dy) * dem_geom.dy / rain_geom.dy;
++    int tile_j = (int)floor(tile_j_f);
++    
++    if (tile_i >= 0 && tile_i < rain_geom.xsz && 
++        tile_j >= 0 && tile_j < rain_geom.ysz) {
++         // Rain data is row-major (y * xsz + x)
++         return rain_data[tile_j * rain_geom.xsz + tile_i];
++    }
++    return 0.0f;
++}
++
++kernel void apply_rain(
++    device float* H [[buffer(0)]],
++    device const float* DEM [[buffer(1)]],
++    device const float* rain_data [[buffer(2)]],
++    constant Geometry& dem_geom [[buffer(3)]],
++    constant Geometry& rain_geom [[buffer(4)]],
++    constant float& dt [[buffer(5)]],
++    constant float& nodata [[buffer(6)]],
++    uint2 gid [[thread_position_in_grid]])
++{
++    int i = gid.x; // 0 to xsz-1
++    int j = gid.y; // 0 to ysz-1
++    
++    if (i >= dem_geom.xsz || j >= dem_geom.ysz) return;
++    
++    // Calculate 1-based index for H/DEM which includes ghost cells
++    int idx = (j + 1) * dem_geom.pitch + (i + 1);
++    
++    float z = DEM[idx];
++    
++    if (abs(z - nodata) < 1e-6f) return;
++    
++    float rate = rate_at_cell(rain_data, i, j, dem_geom, rain_geom);
++    if (rate > 0.0f) {
++        H[idx] += rate * dt;
++    }
++}
++
++// Update ghost cells with reflective (wall) boundary conditions
++// This copies interior values to ghost cells with velocity reflection
++kernel void update_ghost_cells(
++    device float* H [[buffer(0)]],
++    device float* HU [[buffer(1)]],
++    device float* HV [[buffer(2)]],
++    constant Geometry& geom [[buffer(3)]],
++    device const int* boundary_types [[buffer(4)]], // Packed array: N, E, S, W
++    uint gid [[thread_position_in_grid]])
++{
++    int pitch = geom.pitch;
++    int xsz = geom.xsz;
++    int ysz = geom.ysz;
++    
++    // Offset for boundary_types packed array
++    // North: 0
++    // East: xsz
++    // South: xsz + ysz
++    // West: 2*xsz + ysz
++    
++    // West and East boundaries (i=0 and i=xsz+1)
++    if (gid < (uint)(ysz + 2)) {
++        int j = gid;
++        
++        // West boundary (i=0)
++        if (j >= 1 && j <= ysz) {
++            int bc_idx = 2 * xsz + ysz + (ysz - j); // LISFLOOD West index
++            int type = boundary_types[bc_idx];
++            
++            int idx_ghost_w = j * pitch + 0;
++            int idx_interior_w = j * pitch + 1;
++            H[idx_ghost_w] = H[idx_interior_w];
++            HV[idx_ghost_w] = HV[idx_interior_w];
++            if (type == BC_FREE) {
++                HU[idx_ghost_w] = HU[idx_interior_w]; // Simple transmissive (matches CPU fv1)
++            } else {
++                HU[idx_ghost_w] = -HU[idx_interior_w]; // Reflective
++            }
++        }
++        
++        // East boundary (i=xsz+1)
++        if (j >= 1 && j <= ysz) {
++            int bc_idx = xsz + (j - 1); // LISFLOOD East index
++            int type = boundary_types[bc_idx];
++            
++            int idx_ghost_e = j * pitch + xsz + 1;
++            int idx_interior_e = j * pitch + xsz;
++            H[idx_ghost_e] = H[idx_interior_e];
++            HV[idx_ghost_e] = HV[idx_interior_e];
++            if (type == BC_FREE) {
++                HU[idx_ghost_e] = HU[idx_interior_e]; // Simple transmissive (matches CPU fv1)
++            } else {
++                HU[idx_ghost_e] = -HU[idx_interior_e]; // Reflective
++            }
++        }
++    }
++    
++    // North and South boundaries (j=0 and j=ysz+1)
++    if (gid >= 1 && gid <= (uint)xsz) {
++        int i = gid;
++        
++        // North boundary (j=0)
++        int bc_idx_n = i - 1; // LISFLOOD North index
++        int type_n = boundary_types[bc_idx_n];
++        
++        int idx_ghost_n = 0 * pitch + i;
++        int idx_interior_n = 1 * pitch + i;
++        H[idx_ghost_n] = H[idx_interior_n];
++        HU[idx_ghost_n] = HU[idx_interior_n];
++        if (type_n == BC_FREE) {
++            HV[idx_ghost_n] = HV[idx_interior_n]; // Simple transmissive (matches CPU fv1)
++        } else {
++            HV[idx_ghost_n] = -HV[idx_interior_n]; // Reflective
++        }
++        
++        // South boundary (j=ysz+1)
++        int bc_idx_s = 2 * xsz + ysz - i; // LISFLOOD South index
++        int type_s = boundary_types[bc_idx_s];
++        
++        int idx_ghost_s = (ysz + 1) * pitch + i;
++        int idx_interior_s = ysz * pitch + i;
++        H[idx_ghost_s] = H[idx_interior_s];
++        HU[idx_ghost_s] = HU[idx_interior_s];
++        if (type_s == BC_FREE) {
++            HV[idx_ghost_s] = HV[idx_interior_s]; // Simple transmissive (matches CPU fv1)
++        } else {
++            HV[idx_ghost_s] = -HV[idx_interior_s]; // Reflective
++        }
++    }
++}
++
++// Drain water from NoData cells (implements drain_nodata functionality)
++// Water entering NoData cells is eliminated (removed from simulation)
++kernel void drain_nodata_cells(
++    device float* H [[buffer(0)]],
++    device float* HU [[buffer(1)]],
++    device float* HV [[buffer(2)]],
++    device const float* DEM [[buffer(3)]],
++    constant Geometry& geom [[buffer(4)]],
++    constant float& nodata [[buffer(5)]],
++    device atomic_uint* mass_totals [[buffer(6)]],
++    uint2 gid [[thread_position_in_grid]])
++{
++    int i = gid.x + 1;
++    int j = gid.y + 1;
++    
++    if (i > geom.xsz || j > geom.ysz) return;
++    
++    int idx = j * geom.pitch + i;
++    float z = DEM[idx];
++    
++    // If this is a NoData cell, eliminate any water
++    if (abs(z - nodata) < 1.0f) {
++        if (H[idx] > 0.0f) atomic_add_float(&mass_totals[2], H[idx] * geom.dx * geom.dy);
++        H[idx] = 0.0f;
++        HU[idx] = 0.0f;
++        HV[idx] = 0.0f;
++    }
++}
++
++// Accumulate total outflow volume from FREE boundaries
++// This kernel runs on 4 boundary sides and uses atomics to sum volume
++kernel void accumulate_outflow(
++    device const float* H [[buffer(0)]],
++    device const float* HU [[buffer(1)]],
++    device const float* HV [[buffer(2)]],
++    device const int* boundary_types [[buffer(3)]],
++    device atomic_uint* vol_out [[buffer(4)]], // Array of 4 totals: N, E, S, W
++    constant Geometry& geom [[buffer(5)]],
++    constant float& dt [[buffer(6)]],
++    uint gid [[thread_position_in_grid]])
++{
++    int pitch = geom.pitch;
++    int xsz = geom.xsz;
++    int ysz = geom.ysz;
++    
++    // West and East boundaries
++    if (gid < (uint)ysz) {
++        int j = gid + 1;
++        
++        // West boundary (i=1) - outflow is NEGATIVE HU
++        int bc_idx_w = 2 * xsz + ysz + (ysz - j);
++        if (boundary_types[bc_idx_w] == BC_FREE) {
++            float flux = -HU[j * pitch + 1] * geom.dy * dt;
++            if (flux > 0) atomic_add_float(&vol_out[3], flux);
++        }
++        
++        // East boundary (i=xsz) - outflow is POSITIVE HU
++        int bc_idx_e = xsz + (j - 1);
++        if (boundary_types[bc_idx_e] == BC_FREE) {
++            float flux = HU[j * pitch + xsz] * geom.dy * dt;
++            if (flux > 0) atomic_add_float(&vol_out[1], flux);
++        }
++    }
++    
++    // North and South boundaries
++    if (gid < (uint)xsz) {
++        int i = gid + 1;
++        
++        // North boundary (j=1) - outflow is NEGATIVE HV
++        int bc_idx_n = i - 1;
++        if (boundary_types[bc_idx_n] == BC_FREE) {
++            float flux = -HV[1 * pitch + i] * geom.dx * dt;
++            if (flux > 0) atomic_add_float(&vol_out[0], flux);
++        }
++        
++        // South boundary (j=ysz) - outflow is POSITIVE HV
++        int bc_idx_s = xsz + ysz + (xsz - i);
++        if (boundary_types[bc_idx_s] == BC_FREE) {
++            float flux = HV[ysz * pitch + i] * geom.dx * dt;
++            if (flux > 0) atomic_add_float(&vol_out[2], flux);
++        }
++    }
++}
++
++// Track the running maximum water depth per cell.
++// Mirrors update_max_field() in swe/stats.cpp, which the CPU solver calls once
++// per timestep. Keeping this on the GPU avoids having to copy H back to the
++// host every step just to maintain the .max output.
++kernel void update_max_field(
++    device const float* H [[buffer(0)]],
++    device float* maxH [[buffer(1)]],
++    constant Geometry& geom [[buffer(2)]],
++    uint2 gid [[thread_position_in_grid]])
++{
++    int i = gid.x + 1;
++    int j = gid.y + 1;
++
++    if (i > geom.xsz || j > geom.ysz) return;
++
++    int idx = j * geom.pitch + i;
++    maxH[idx] = max(maxH[idx], H[idx]);
++}
+diff -ruN a/metal/fv1/metal_fv1_simulate.h b/metal/fv1/metal_fv1_simulate.h
+--- a/metal/fv1/metal_fv1_simulate.h	1970-01-01 01:00:00
++++ b/metal/fv1/metal_fv1_simulate.h	2026-10-08 21:46:09
+@@ -0,0 +1,78 @@
++//
++// LISFLOOD-FP Metal FV1 Solver - Header
++// C++ interface to Metal GPU compute
++//
++
++#pragma once
++
++#ifdef __APPLE__
++
++#include "../../geometry.h"
++#include "../../lisflood.h"
++
++namespace lis {
++namespace metal {
++namespace fv1 {
++
++// Forward declaration of implementation
++struct SimulatorImpl;
++
++// Metal FV1 flow fields (mirroring CUDA structure)
++struct Flow {
++  NUMERIC_TYPE *H;
++  NUMERIC_TYPE *HU;
++  NUMERIC_TYPE *HV;
++  NUMERIC_TYPE *maxH;
++  NUMERIC_TYPE *totalHtm;
++  NUMERIC_TYPE *maxHtm;
++  NUMERIC_TYPE *initHtm;
++};
++
++// Main simulator class
++class Simulator {
++public:
++  Simulator(Fnames &filenames, Pars &pars, Solver &solver, Arrays &arrays,
++            States &states, BoundCs &boundCs, int verbose);
++
++  ~Simulator();
++
++  // Initialize from CPU data
++  void initialize(NUMERIC_TYPE *H, NUMERIC_TYPE *HU, NUMERIC_TYPE *HV,
++                  NUMERIC_TYPE *DEM, NUMERIC_TYPE *Mann);
++
++  // Run one timestep
++  NUMERIC_TYPE step();
++
++  // Copy results back to CPU
++  void copy_to_host(NUMERIC_TYPE *H, NUMERIC_TYPE *HU, NUMERIC_TYPE *HV);
++
++  // Copy the running maximum depth field back to CPU (for the .max output)
++  void copy_max_to_host(NUMERIC_TYPE *maxH);
++
++  // Get current simulation time
++  NUMERIC_TYPE get_time() const;
++
++  // Update uniform rainfall
++  void apply_uniform_rain(NUMERIC_TYPE rain_rate);
++
++  // Check if Metal is available on this system
++  static bool is_available();
++
++  // Check if this simulator instance is valid (initialized successfully)
++  bool is_valid() const { return impl != nullptr; }
++
++private:
++  SimulatorImpl *impl; // Pointer to implementation (PIMPL idiom)
++};
++
++// Entry point for LISFLOOD-FP integration
++// Entry point for LISFLOOD-FP integration
++void simulate(Fnames &filenames, Files *files, States &states, Pars &pars,
++              ::Solver &solver, BoundCs &boundCs, Stage &stage, Arrays &arrays,
++              int verbose);
++
++} // namespace fv1
++} // namespace metal
++} // namespace lis
++
++#endif // __APPLE__
+diff -ruN a/metal/fv1/metal_fv1_simulate.mm b/metal/fv1/metal_fv1_simulate.mm
+--- a/metal/fv1/metal_fv1_simulate.mm	1970-01-01 01:00:00
++++ b/metal/fv1/metal_fv1_simulate.mm	2026-10-08 21:46:09
+@@ -0,0 +1,1493 @@
++//
++// LISFLOOD-FP Metal FV1 Solver - Implementation
++// Objective-C++ for Metal API access
++//
++
++#ifdef __APPLE__
++
++#include "metal_fv1_simulate.h"
++#include "../../rain/rain.h"
++#include "../../rain/rain.tpp"
++#include "../../swe/fv1.h"              // CPU FV1 solver functions
++#include "../../swe/fv1/modifiedvars.h" // initialise_Zstar
++#include "../../swe/output.h"           // write_mass_stats, write_solution
++#include "../../swe/stats.h"            // update_mass_stats, DomainVol
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#include <algorithm>
++#include <cmath>
++
++namespace lis {
++namespace metal {
++namespace fv1 {
++
++// Threadgroup tile used by the flux-sharing sweeps (must match TG_X/TG_Y in
++// metal_fv1_kernels.metal).
++static const NSUInteger kTileX = 16;
++static const NSUInteger kTileY = 16;
++
++// Metal geometry structure (must match shader)
++struct MetalGeometry {
++  int32_t xsz;
++  int32_t ysz;
++  int32_t pitch;
++  float dx;
++  float dy;
++  float tly;
++  float blx;
++  float bly;
++};
++
++// Metal physical params (must match shader)
++struct MetalPhysicalParams {
++  float g;
++  float manning;
++  float speed_thresh;
++};
++
++// Metal solver params (must match shader)
++struct MetalSolverParams {
++  float dt;
++  float depth_thresh;
++};
++
++// Implementation class using PIMPL idiom
++struct SimulatorImpl {
++  // Metal objects
++  id<MTLDevice> device;
++  id<MTLCommandQueue> commandQueue;
++  id<MTLLibrary> library;
++
++  // Compute pipelines
++  id<MTLComputePipelineState> applyFrictionPipeline;
++  id<MTLComputePipelineState> computeZstarXPipeline;
++  id<MTLComputePipelineState> computeZstarYPipeline;
++  id<MTLComputePipelineState> updateFlowXPipeline;
++  id<MTLComputePipelineState> updateFlowYPipeline;
++  id<MTLComputePipelineState> computeDtPipeline;
++  id<MTLComputePipelineState> zeroGhostCellsPipeline;
++  id<MTLComputePipelineState> applyUniformRainPipeline;
++  id<MTLComputePipelineState> applyRainPipeline; // For dynamic rain
++  id<MTLComputePipelineState>
++      updateGhostCellsPipeline; // Reflective ghost cells
++  id<MTLComputePipelineState>
++      drainNodataPipeline; // Drain water from NoData cells
++  id<MTLComputePipelineState>
++      accumulateOutflowPipeline; // Accumulate water leaving domain
++  id<MTLComputePipelineState>
++      updateMaxFieldPipeline; // Running per-cell maximum depth
++
++  // Buffers for flow variables (double-buffered)
++  id<MTLBuffer> H[2];
++  id<MTLBuffer> HU[2];
++  id<MTLBuffer> HV[2];
++  id<MTLBuffer> H_int; // Intermediate state between x and y sweeps
++  id<MTLBuffer> HU_int;
++  id<MTLBuffer> HV_int;
++  id<MTLBuffer> maxH; // Running maximum depth, for the .max output
++
++  // Buffers for grid data
++  id<MTLBuffer> DEM;
++  id<MTLBuffer> Zstar_x;
++  id<MTLBuffer> Zstar_y;
++  id<MTLBuffer> manning;
++  id<MTLBuffer> dt_field;
++  id<MTLBuffer> minDtBuffer; // For atomic reduction
++
++  // Parameter buffers
++  id<MTLBuffer> geomBuffer;
++  id<MTLBuffer> physicsBuffer;
++  id<MTLBuffer> solverBuffer;
++
++  // Boundary flux buffers
++  id<MTLBuffer> flux_west;
++  id<MTLBuffer> flux_east;
++  id<MTLBuffer> flux_north;
++  id<MTLBuffer> flux_south;
++
++  // Rain buffers
++  id<MTLBuffer> rainDataBuffer;
++  id<MTLBuffer> rainGeometryBuffer;
++
++  // Boundary condition type buffer, plus the per-edge-cell prescribed value
++  // (stage or unit discharge) refreshed every step for the time-varying types.
++  id<MTLBuffer> boundaryTypesBuffer;
++  id<MTLBuffer> boundaryValuesBuffer;
++
++  // Simulation state
++  int current_buffer; // 0 or 1 for double buffering
++  MetalGeometry geom;
++  MetalPhysicalParams physics;
++  MetalSolverParams solverParams;
++  NUMERIC_TYPE time;
++  NUMERIC_TYPE cfl;
++  NUMERIC_TYPE max_dt;
++  NUMERIC_TYPE nodata;
++  // The GPU works in single precision, so the DEM is stored relative to the
++  // lowest valid elevation and NoData cells are given a pit a fixed distance
++  // below that, rather than the raw nodata_elevation (typically -9999).
++  // The FV1 scheme only ever uses elevation *differences* (Z*, ETA - Z*,
++  // Zdagger differences), so the shift is exact; what it buys is conditioning.
++  // At -9999 a float32 ulp is ~9.8e-4 m, i.e. the same size as DepthThresh, so
++  // (h + Z) - Z* inside the NoData region lost the depth entirely and the
++  // scheme silently leaked mass. See dem_offset/gpu_nodata use in copyToGPU().
++  float dem_offset;
++  float gpu_nodata;
++  bool has_manning_map;
++  bool is_first_step;
++  int verbose;
++  id<MTLBuffer> volOutBuffer; // Buffer for tracking outflow volume
++  double last_mass_sync_time = 0.0;
++  double vol_out_total;       // Host-side cumulative outflow (m3)
++  double last_rain_time;      // Simulation time of last rain upload
++  double current_rain_sum;    // Sum of current rain grid for sub-basin (m3/s)
++  double
++      interval_out_total; // Outflow accumulated since last mass balance check
++
++  size_t buffer_size;
++  size_t num_cells;
++
++  // CPU data pointers
++  Arrays *arrays;
++  BoundCs *boundCs;
++  Pars *pars;
++  ::Solver *solver;
++  States *states;
++
++  // Dynamic Rain object
++  ::DynamicRain<std::allocator<NUMERIC_TYPE>> *dynamic_rain;
++
++  SimulatorImpl()
++      : device(nil), commandQueue(nil), library(nil), current_buffer(0),
++        time(0), cfl(0.7), max_dt(10.0), nodata(-9999), dem_offset(0.0f),
++        gpu_nodata(-1000.0f), has_manning_map(false),
++        is_first_step(true), verbose(0), volOutBuffer(nil), vol_out_total(0.0), last_rain_time(-1.0),
++        current_rain_sum(0.0), interval_out_total(0.0), arrays(nullptr),
++        boundCs(nullptr), pars(nullptr), solver(nullptr), states(nullptr),
++        dynamic_rain(nullptr) {}
++
++  ~SimulatorImpl() {
++    if (dynamic_rain) {
++      delete dynamic_rain;
++      dynamic_rain = nullptr;
++    }
++  }
++
++  bool init(Fnames &filenames, Pars &pars, ::Solver &solver, int verb) {
++    verbose = verb;
++
++    // Initialize Dynamic Rain
++    // Note: DynamicRain constructor reads file header.
++    dynamic_rain = new ::DynamicRain<std::allocator<NUMERIC_TYPE>>(
++        filenames.dynamicrainfilename, verbose);
++
++    // Get default Metal device
++    device = MTLCreateSystemDefaultDevice();
++    if (!device) {
++      if (verbose)
++        printf("Metal: No GPU device found\n");
++      return false;
++    }
++
++    if (verbose) {
++      printf("Metal: Using GPU: %s\n", [[device name] UTF8String]);
++      printf("Metal: Unified Memory: %s\n",
++             device.hasUnifiedMemory ? "Yes" : "No");
++    }
++
++    // Create command queue
++    commandQueue = [device newCommandQueue];
++    if (!commandQueue) {
++      if (verbose)
++        printf("Metal: Failed to create command queue\n");
++      return false;
++    }
++
++    // Load shader library
++    NSError *error = nil;
++
++    // 1. Try bundle (portable for apps)
++    NSString *libraryPath =
++        [[NSBundle mainBundle] pathForResource:@"metal_fv1_kernels"
++                                        ofType:@"metallib"];
++
++    // 2. Try current directory
++    if (!libraryPath) {
++      if ([[NSFileManager defaultManager]
++              fileExistsAtPath:@"metal_fv1_kernels.metallib"]) {
++        libraryPath = @"metal_fv1_kernels.metallib";
++      }
++    }
++
++    // 3. Try directory of executable
++    if (!libraryPath) {
++      NSString *executablePath = [[NSProcessInfo processInfo] arguments][0];
++      NSString *executableDir =
++          [executablePath stringByDeletingLastPathComponent];
++      NSString *path = [executableDir
++          stringByAppendingPathComponent:@"metal_fv1_kernels.metallib"];
++      if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
++        libraryPath = path;
++      }
++    }
++
++    if (libraryPath) {
++      if (verbose) printf("Metal: Shader library: %s\n", [libraryPath UTF8String]);
++      library = [device newLibraryWithFile:libraryPath error:&error];
++    }
++
++    // 4. Compile from source if the source is found relative to the executable
++    if (!library) {
++      NSString *executablePath = [[NSProcessInfo processInfo] arguments][0];
++      NSString *executableDir =
++          [executablePath stringByDeletingLastPathComponent];
++      // Go up from build/ to find metal/fv1/
++      NSString *shaderPath =
++          [executableDir stringByAppendingPathComponent:
++                             @"../metal/fv1/metal_fv1_kernels.metal"];
++      NSString *shaderSource =
++          [NSString stringWithContentsOfFile:shaderPath
++                                    encoding:NSUTF8StringEncoding
++                                       error:nil];
++
++      if (shaderSource) {
++        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
++        options.fastMathEnabled = YES;
++        library = [device newLibraryWithSource:shaderSource
++                                       options:options
++                                         error:&error];
++      }
++    }
++
++    if (!library) {
++      if (verbose)
++        printf("Metal: Failed to load shader library: %s\n",
++               [[error localizedDescription] UTF8String]);
++      return false;
++    }
++
++    // Create compute pipelines
++    if (!createPipelines()) {
++      return false;
++    }
++
++    // Set up geometry
++    geom.xsz = pars.xsz;
++    geom.ysz = pars.ysz;
++    geom.pitch = pars.xsz + 2; // Add ghost cells
++    geom.dx = (float)pars.dx;
++    geom.dy = (float)pars.dy;
++    geom.tly = (float)pars.tly;
++    geom.blx = (float)pars.blx;
++    geom.bly = (float)pars.bly;
++
++    // Physical params
++    physics.g = (float)solver.g;
++    physics.manning = (float)pars.FPn;
++    physics.speed_thresh = (float)solver.SpeedThresh;
++
++    // Solver params
++    solverParams.dt = (float)solver.InitTstep;
++    solverParams.depth_thresh = (float)solver.DepthThresh;
++
++    cfl = solver.cfl;
++    max_dt = solver.InitTstep;
++    nodata = pars.nodata_elevation;
++
++    // Calculate buffer sizes
++    num_cells = (geom.xsz + 2) * (geom.ysz + 2);
++    buffer_size = num_cells * sizeof(float);
++
++    // Allocate buffers
++    if (!allocateBuffers()) {
++      return false;
++    }
++
++    // Allocate Rain Buffers
++    if (dynamic_rain && dynamic_rain->enabled()) {
++      const Geometry &rgeom = dynamic_rain->geometry();
++
++      // Rain Data Buffer
++      size_t rsize = rgeom.xsz * rgeom.ysz *
++                     sizeof(NUMERIC_TYPE); // assuming standard float
++      // Note: rain data is NUMERIC_TYPE (likely float or double).
++      // If double, we might need conversion or kernels that handle double
++      // (Metal supports float primarily, double on some). Ideally convert to
++      // float if NUMERIC_TYPE is double. For now assume NUMERIC_TYPE is float
++      // (as per user objective "single precision").
++
++      rainDataBuffer =
++          [device newBufferWithLength:rsize
++                              options:MTLResourceStorageModeManaged];
++
++      // Rain Geometry (MetalGeometry)
++      MetalGeometry mRGeom;
++      mRGeom.xsz = rgeom.xsz;
++      mRGeom.ysz = rgeom.ysz;
++      mRGeom.dx = (float)rgeom.dx;
++      mRGeom.dy = (float)rgeom.dy;
++      mRGeom.tly = (float)rgeom.tly;
++      mRGeom.blx = (float)rgeom.blx;
++      mRGeom.bly = (float)rgeom.bly;
++      // Pitch not really used for rain grid usually linear, but let's set it
++      mRGeom.pitch = rgeom.xsz;
++
++      rainGeometryBuffer =
++          [device newBufferWithBytes:&mRGeom
++                              length:sizeof(MetalGeometry)
++                             options:MTLResourceStorageModeShared];
++
++      if (verbose) {
++        printf("Metal: Dynamic Rain enabled. Grid: %d x %d\n", rgeom.xsz,
++               rgeom.ysz);
++      }
++    }
++
++    if (verbose) {
++      printf("Metal: Grid size: %d x %d\n", geom.xsz, geom.ysz);
++      printf("Metal: dx = %.2f m, dy = %.2f m\n", geom.dx, geom.dy);
++      printf("Metal: g = %.2f m/s², CFL = %.2f, max_dt = %.2f s\n", physics.g,
++             cfl, max_dt);
++      printf("Metal: Buffer size: %.2f MB per field\n",
++             buffer_size / (1024.0 * 1024.0));
++    }
++
++    return true;
++  }
++
++  bool createPipelines() {
++    NSError *error = nil;
++
++    auto createPipeline = [&](const char *name) -> id<MTLComputePipelineState> {
++      id<MTLFunction> func =
++          [library newFunctionWithName:[NSString stringWithUTF8String:name]];
++      if (!func) {
++        if (verbose)
++          printf("Metal: Function '%s' not found\n", name);
++        return nil;
++      }
++      id<MTLComputePipelineState> pipeline =
++          [device newComputePipelineStateWithFunction:func error:&error];
++      if (!pipeline && verbose) {
++        printf("Metal: Failed to create pipeline for '%s'\n", name);
++      }
++      return pipeline;
++    };
++
++    applyFrictionPipeline = createPipeline("apply_friction");
++    computeZstarXPipeline = createPipeline("compute_zstar_x");
++    computeZstarYPipeline = createPipeline("compute_zstar_y");
++    updateFlowXPipeline = createPipeline("update_flow_x");
++    updateFlowYPipeline = createPipeline("update_flow_y");
++    computeDtPipeline = createPipeline("compute_dt_per_cell");
++    zeroGhostCellsPipeline = createPipeline("zero_ghost_cells");
++    applyUniformRainPipeline = createPipeline("apply_uniform_rain");
++    applyRainPipeline = createPipeline("apply_rain");
++    updateGhostCellsPipeline = createPipeline("update_ghost_cells");
++    drainNodataPipeline = createPipeline("drain_nodata_cells");
++    accumulateOutflowPipeline = createPipeline("accumulate_outflow");
++    updateMaxFieldPipeline = createPipeline("update_max_field");
++
++    return updateFlowXPipeline && updateFlowYPipeline &&
++           accumulateOutflowPipeline;
++  }
++
++  bool allocateBuffers() {
++    MTLResourceOptions options = MTLResourceStorageModeShared; // Unified memory
++
++    // Flow variables (double buffered)
++    for (int i = 0; i < 2; i++) {
++      H[i] = [device newBufferWithLength:buffer_size options:options];
++      HU[i] = [device newBufferWithLength:buffer_size options:options];
++      HV[i] = [device newBufferWithLength:buffer_size options:options];
++      if (!H[i] || !HU[i] || !HV[i])
++        return false;
++    }
++
++    // Intermediate buffers
++    H_int = [device newBufferWithLength:buffer_size options:options];
++    HU_int = [device newBufferWithLength:buffer_size options:options];
++    HV_int = [device newBufferWithLength:buffer_size options:options];
++    maxH = [device newBufferWithLength:buffer_size options:options];
++    if (!maxH)
++      return false;
++
++    // Grid data
++    DEM = [device newBufferWithLength:buffer_size options:options];
++    Zstar_x = [device newBufferWithLength:buffer_size options:options];
++    Zstar_y = [device newBufferWithLength:buffer_size options:options];
++    dt_field = [device newBufferWithLength:buffer_size options:options];
++    minDtBuffer = [device newBufferWithLength:sizeof(uint32_t)
++                                      options:MTLResourceStorageModeShared];
++    manning = [device newBufferWithLength:buffer_size options:options];
++
++    // Zero out all buffers to ensure clean state
++    for (int i = 0; i < 2; i++) {
++      memset([H[i] contents], 0, buffer_size);
++      memset([HU[i] contents], 0, buffer_size);
++      memset([HV[i] contents], 0, buffer_size);
++    }
++    memset([H_int contents], 0, buffer_size);
++    memset([HU_int contents], 0, buffer_size);
++    memset([HV_int contents], 0, buffer_size);
++    memset([DEM contents], 0, buffer_size);
++    memset([Zstar_x contents], 0, buffer_size);
++    memset([Zstar_y contents], 0, buffer_size);
++    memset([dt_field contents], 0, buffer_size);
++    memset([minDtBuffer contents], 0, sizeof(uint32_t));
++    memset([manning contents], 0, buffer_size);
++
++    // Parameter buffers
++    geomBuffer = [device newBufferWithBytes:&geom
++                                     length:sizeof(MetalGeometry)
++                                    options:options];
++    physicsBuffer = [device newBufferWithBytes:&physics
++                                        length:sizeof(MetalPhysicalParams)
++                                       options:options];
++    solverBuffer = [device newBufferWithBytes:&solverParams
++                                       length:sizeof(MetalSolverParams)
++                                      options:options];
++
++    // Allocate flux buffers
++    flux_west = [device newBufferWithLength:geom.ysz * sizeof(float) * 3
++                                    options:options];
++    flux_east = [device newBufferWithLength:geom.ysz * sizeof(float) * 3
++                                    options:options];
++    flux_north = [device newBufferWithLength:geom.xsz * sizeof(float) * 3
++                                     options:options];
++    flux_south = [device newBufferWithLength:geom.xsz * sizeof(float) * 3
++                                     options:options];
++
++    // Allocate boundary condition types buffer
++    int num_bc_cells = 2 * geom.xsz + 2 * geom.ysz;
++    boundaryTypesBuffer =
++        [device newBufferWithLength:num_bc_cells * sizeof(int32_t)
++                            options:options];
++    boundaryValuesBuffer =
++        [device newBufferWithLength:num_bc_cells * sizeof(float)
++                            options:options];
++
++    // Allocate tracking buffers
++    volOutBuffer = [device newBufferWithLength:8 * sizeof(float)
++                                       options:options];
++
++    memset([volOutBuffer contents], 0, 8 * sizeof(float));
++
++    return DEM && Zstar_x && Zstar_y && geomBuffer && physicsBuffer &&
++           solverBuffer && flux_west && flux_east && flux_north && flux_south &&
++           boundaryTypesBuffer && volOutBuffer;
++  }
++
++  void copyToGPU(NUMERIC_TYPE *h_H, NUMERIC_TYPE *h_HU, NUMERIC_TYPE *h_HV,
++                 NUMERIC_TYPE *h_DEM, NUMERIC_TYPE *h_Mann) {
++    float *d_H = (float *)[H[current_buffer] contents];
++    float *d_HU = (float *)[HU[current_buffer] contents];
++    float *d_HV = (float *)[HV[current_buffer] contents];
++    float *d_DEM = (float *)[DEM contents];
++    float *d_Mann = (float *)[manning contents];
++
++    // Zero all flow buffers first (including both double buffers)
++    for (int i = 0; i < 2; i++) {
++      memset([H[i] contents], 0, buffer_size);
++      memset([HU[i] contents], 0, buffer_size);
++      memset([HV[i] contents], 0, buffer_size);
++    }
++    memset([DEM contents], 0, buffer_size);
++    memset([manning contents], 0, buffer_size);
++    memset([maxH contents], 0, buffer_size);
++
++    // Copy CPU data to the "active" part of the GPU buffers (1-indexed)
++    // Handle NoData values properly
++    float nodata_val = (float)nodata;
++
++    // Pick the vertical datum for the GPU copy of the DEM. The FV1 scheme only
++    // ever uses elevation *differences* (Z*, ETA - Z*, Zdagger differences), so
++    // rebasing is exact; what it buys is float32 conditioning. At the common
++    // nodata_elevation of -9999 a float32 ulp is ~9.8e-4 m, i.e. the same size
++    // as DepthThresh, which wrecks (h + Z) - Z* inside the NoData region.
++    //
++    // The replacement value must keep the *sense* of nodata_elevation: LISFLOOD
++    // defaults it to DEM_NO_DATA = +1e7, an impermeable wall, while clipped
++    // catchments usually set it to -9999, a pit that drain_nodata empties.
++    // Mapping both onto a pit would let water flood into cells the CPU treats
++    // as solid, so the sign is preserved here.
++    {
++      double min_valid = 0.0, max_valid = 0.0;
++      bool any_valid = false;
++      for (int j = 0; j < geom.ysz; j++) {
++        for (int i = 0; i < geom.xsz; i++) {
++          double z = (double)h_DEM[j * geom.xsz + i];
++          if (fabs(z - (double)nodata) < 1.0)
++            continue;
++          if (!any_valid) {
++            min_valid = max_valid = z;
++            any_valid = true;
++          } else {
++            if (z < min_valid) min_valid = z;
++            if (z > max_valid) max_valid = z;
++          }
++        }
++      }
++      dem_offset = any_valid ? (float)min_valid : 0.0f;
++
++      const float kMargin = 1000.0f; // far beyond any credible water depth
++      if (!any_valid) {
++        gpu_nodata = (float)nodata;
++      } else if ((double)nodata > max_valid) {
++        gpu_nodata = (float)(max_valid - min_valid) + kMargin;  // wall
++      } else if ((double)nodata < min_valid) {
++        gpu_nodata = -kMargin;                                   // pit
++      } else {
++        gpu_nodata = (float)((double)nodata - min_valid);        // as given
++      }
++      if (verbose)
++        printf("Metal: DEM datum shifted by %.3f m; NoData (%.1f) mapped to "
++               "%.1f m [%s]\n",
++               dem_offset, (double)nodata, gpu_nodata,
++               ((double)nodata > max_valid) ? "wall" : "pit");
++    }
++
++    for (int j = 0; j < geom.ysz; j++) {
++      for (int i = 0; i < geom.xsz; i++) {
++        int cpu_idx = j * geom.xsz + i;
++        int gpu_idx = (j + 1) * geom.pitch + (i + 1);
++
++        float dem = (float)h_DEM[cpu_idx];
++
++        // Check if this is a NoData cell
++        bool is_nodata = (fabs(dem - nodata_val) < 1.0f);
++
++        if (is_nodata) {
++          // NoData cell: set DEM to the GPU pit value, zero flow
++          d_DEM[gpu_idx] = gpu_nodata;
++          d_H[gpu_idx] = 0.0f;
++          d_HU[gpu_idx] = 0.0f;
++          d_HV[gpu_idx] = 0.0f;
++          // Roughness still has to match the CPU here. NoData cells all sit at
++          // nodata_elevation, so between two of them Z* is flat and water that
++          // spills in spreads across them freely. LoadManningsn() gives those
++          // cells Parptr->FPn, so zeroing n made the whole NoData region
++          // frictionless and let water run far deeper into it than on the CPU.
++          d_Mann[gpu_idx] =
++              h_Mann ? (float)h_Mann[cpu_idx] : physics.manning;
++        } else {
++          // Valid data cell
++          float h = (float)h_H[cpu_idx];
++
++          d_H[gpu_idx] = h;
++          d_HU[gpu_idx] = (float)h_HU[cpu_idx];
++          d_HV[gpu_idx] = -(float)h_HV[cpu_idx];
++          d_DEM[gpu_idx] = dem - dem_offset;
++
++          if (h_Mann) {
++            d_Mann[gpu_idx] = (float)h_Mann[cpu_idx];
++          } else {
++            d_Mann[gpu_idx] = physics.manning; // Use uniform value
++          }
++        }
++      }
++    }
++
++    has_manning_map = (h_Mann != nullptr);
++
++    // Fill DEM ghost cells (zero-gradient boundary conditions)
++    // This is critical to avoid artificial "cliffs" at the boundary
++    for (int j = 1; j <= geom.ysz; j++) {
++      d_DEM[j * geom.pitch + 0] = d_DEM[j * geom.pitch + 1]; // West
++      d_DEM[j * geom.pitch + geom.xsz + 1] =
++          d_DEM[j * geom.pitch + geom.xsz]; // East
++    }
++    for (int i = 0; i < geom.pitch; i++) {
++      d_DEM[0 * geom.pitch + i] = d_DEM[1 * geom.pitch + i]; // North
++      d_DEM[(geom.ysz + 1) * geom.pitch + i] =
++          d_DEM[geom.ysz * geom.pitch + i]; // South
++    }
++
++    // Populate boundary condition types buffer
++    if (boundCs && boundCs->BC_Ident) {
++      int32_t *d_bc = (int32_t *)[boundaryTypesBuffer contents];
++      int num_bc_cells = 2 * geom.xsz + 2 * geom.ysz;
++      // Pass the real BC_Ident through. Collapsing everything that was not
++      // FREE into a reflective wall silently discarded QFIX/QVAR/HFIX/HVAR
++      // boundaries, so prescribed inflows never entered the domain.
++      for (int i = 0; i < num_bc_cells; i++) {
++        d_bc[i] = (int32_t)boundCs->BC_Ident[i];
++      }
++    }
++
++    // Compute Z-star fields (bed levels at interfaces)
++    @autoreleasepool {
++      id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
++      id<MTLComputeCommandEncoder> encoder =
++          [commandBuffer computeCommandEncoder];
++
++      MTLSize gridSize = MTLSizeMake(geom.xsz + 1, geom.ysz, 1);
++      MTLSize threadGroupSize = MTLSizeMake(16, 16, 1);
++
++      // Compute Zstar_x
++      if (computeZstarXPipeline) {
++        [encoder setComputePipelineState:computeZstarXPipeline];
++        [encoder setBuffer:DEM offset:0 atIndex:0];
++        [encoder setBuffer:Zstar_x offset:0 atIndex:1];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:2];
++        [encoder dispatchThreads:gridSize
++            threadsPerThreadgroup:threadGroupSize];
++      }
++
++      // Compute Zstar_y
++      gridSize = MTLSizeMake(geom.xsz, geom.ysz + 1, 1);
++      if (computeZstarYPipeline) {
++        [encoder setComputePipelineState:computeZstarYPipeline];
++        [encoder setBuffer:DEM offset:0 atIndex:0];
++        [encoder setBuffer:Zstar_y offset:0 atIndex:1];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:2];
++        [encoder dispatchThreads:gridSize
++            threadsPerThreadgroup:threadGroupSize];
++      }
++
++      // Set initial ghost cells for H, HU, HV (reflective BCs)
++      if (updateGhostCellsPipeline) {
++        [encoder setComputePipelineState:updateGhostCellsPipeline];
++        [encoder setBuffer:H[current_buffer] offset:0 atIndex:0];
++        [encoder setBuffer:HU[current_buffer] offset:0 atIndex:1];
++        [encoder setBuffer:HV[current_buffer] offset:0 atIndex:2];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:3];
++        [encoder setBuffer:boundaryTypesBuffer offset:0 atIndex:4];
++
++        int maxBoundarySize = std::max(geom.pitch, geom.ysz + 2);
++        MTLSize ghostGridSize = MTLSizeMake(maxBoundarySize, 1, 1);
++        MTLSize ghostThreadGroupSize = MTLSizeMake(64, 1, 1);
++        [encoder dispatchThreads:ghostGridSize
++            threadsPerThreadgroup:ghostThreadGroupSize];
++      }
++
++      [encoder endEncoding];
++      [commandBuffer commit];
++      [commandBuffer waitUntilCompleted];
++    }
++
++    if (verbose) {
++      printf("Metal: Initialized Z-star fields\n");
++    }
++  }
++
++  void syncMassTotals() {
++    @autoreleasepool {
++      id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
++      [commandBuffer commit];
++      [commandBuffer waitUntilCompleted];
++
++      float *totals = (float *)[volOutBuffer contents];
++      const double out_boundary = (double)totals[0];
++      const double out_drain = (double)totals[2];
++      const double out = out_boundary + out_drain;
++      const double in = totals[1];
++      const double uniform_rain = totals[3];
++      const double elapsed = (double)time - last_mass_sync_time;
++
++      if (verbose && elapsed > 0.0) {
++        printf("Metal mass: t=%.1f  boundary_out=%.4e  nodata_drain=%.4e  "
++               "boundary_in=%.4e\n",
++               (double)time, out_boundary, out_drain, in);
++        fflush(stdout);
++      }
++      if (boundCs) {
++        boundCs->VolOutMT += (NUMERIC_TYPE)out;
++        boundCs->VolInMT += (NUMERIC_TYPE)(in + uniform_rain);
++        pars->RainTotalLoss += (NUMERIC_TYPE)uniform_rain;
++        if (elapsed > 0.0) {
++          boundCs->Qout += (NUMERIC_TYPE)(out / elapsed);
++          boundCs->Qin += (NUMERIC_TYPE)(in / elapsed);
++        }
++      }
++      last_mass_sync_time = (double)time;
++
++      // Zero the GPU counters for the next interval
++      memset([volOutBuffer contents], 0, 8 * sizeof(float));
++    }
++  }
++
++  void copyFromGPU(NUMERIC_TYPE *h_H, NUMERIC_TYPE *h_HU, NUMERIC_TYPE *h_HV) {
++    // Sync mass balance first to ensure the final numbers are captured
++    syncMassTotals();
++
++    float *d_H = (float *)[H[current_buffer] contents];
++    float *d_HU = (float *)[HU[current_buffer] contents];
++    float *d_HV = (float *)[HV[current_buffer] contents];
++
++    for (int j = 0; j < geom.ysz; j++) {
++      for (int i = 0; i < geom.xsz; i++) {
++        int cpu_idx = j * geom.xsz + i;
++        int gpu_idx = (j + 1) * geom.pitch + (i + 1);
++
++        h_H[cpu_idx] = (NUMERIC_TYPE)d_H[gpu_idx];
++        h_HU[cpu_idx] = (NUMERIC_TYPE)d_HU[gpu_idx];
++        h_HV[cpu_idx] = -(NUMERIC_TYPE)d_HV[gpu_idx];
++      }
++    }
++  }
++
++  void copyMaxFromGPU(NUMERIC_TYPE *h_maxH) {
++    if (h_maxH == nullptr)
++      return;
++
++    @autoreleasepool {
++      id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
++      [commandBuffer commit];
++      [commandBuffer waitUntilCompleted];
++    }
++
++    const float *d_maxH = (const float *)[maxH contents];
++    for (int j = 0; j < geom.ysz; j++) {
++      for (int i = 0; i < geom.xsz; i++) {
++        h_maxH[j * geom.xsz + i] =
++            (NUMERIC_TYPE)d_maxH[(j + 1) * geom.pitch + (i + 1)];
++      }
++    }
++  }
++
++  void uploadState(NUMERIC_TYPE *h_H, NUMERIC_TYPE *h_HU, NUMERIC_TYPE *h_HV) {
++    float *d_H = (float *)[H[current_buffer] contents];
++    float *d_HU = (float *)[HU[current_buffer] contents];
++    float *d_HV = (float *)[HV[current_buffer] contents];
++
++    for (int j = 0; j < geom.ysz; j++) {
++      for (int i = 0; i < geom.xsz; i++) {
++        int cpu_idx = j * geom.xsz + i;
++        int gpu_idx = (j + 1) * geom.pitch + (i + 1);
++
++        d_H[gpu_idx] = (float)h_H[cpu_idx];
++        d_HU[gpu_idx] = (float)h_HU[cpu_idx];
++        d_HV[gpu_idx] = -(float)h_HV[cpu_idx];
++      }
++    }
++  }
++
++  void updateBoundaryFluxes() {
++    // Extract fluxes from arrays->Qx, Qy (calculated by BCs on CPU)
++    // Convert Total Q (m3/s) to Unit Flux (m2/s) and Momentum columns
++
++    float *d_west = (float *)[flux_west contents];
++    float *d_east = (float *)[flux_east contents];
++    float *d_north = (float *)[flux_north contents];
++    float *d_south = (float *)[flux_south contents];
++
++    int xsz = geom.xsz;
++    int ysz = geom.ysz;
++    float dx = geom.dx;
++    float dy = geom.dy;
++    float g = physics.g;
++
++    int pitch_x = xsz + 1; // Qx width (xsz+1)
++
++    // West (i=0) and East (i=xsz) Interfaces
++    for (int j = 0; j < ysz; j++) {
++      // West
++      int idx_west = j * pitch_x + 0;
++      float Q_west = (float)arrays->Qx[idx_west];
++
++      float h_west = (float)arrays->H[j * xsz + 0]; // Cell 0
++      // BCs code for x-direction: *qptr = sign*...*Parptr->dy
++      // So Qx is integrated over dy. So unit_q = Qx / dy.
++      float unit_q_west = Q_west / dy;
++
++      d_west[3 * j + 0] = unit_q_west; // F.H
++      if (h_west > 0.001f) {
++        // F.HU = u * F.H + 0.5*g*h^2 = (q/h)*q + ... = q^2/h + ...
++        d_west[3 * j + 1] =
++            (unit_q_west * unit_q_west / h_west) + 0.5f * g * h_west * h_west;
++      } else {
++        d_west[3 * j + 1] = 0.0f;
++      }
++      d_west[3 * j + 2] = 0.0f; // F.HV (approx 0 shear)
++
++      // East
++      int idx_east = j * pitch_x + xsz;
++      float Q_east = (float)arrays->Qx[idx_east];
++      float h_east = (float)arrays->H[j * xsz + (xsz - 1)]; // Last cell
++      float unit_q_east = Q_east / dy;
++
++      d_east[3 * j + 0] = unit_q_east;
++      if (h_east > 0.001f) {
++        d_east[3 * j + 1] =
++            (unit_q_east * unit_q_east / h_east) + 0.5f * g * h_east * h_east;
++      } else {
++        d_east[3 * j + 1] = 0.0f;
++      }
++      d_east[3 * j + 2] = 0.0f;
++    }
++
++    // North (j=0) and South (j=ysz) Interfaces
++    for (int i = 0; i < xsz; i++) {
++      // North
++      // Qy index: j * xsz + i. North i j=0. (Note: Qy is (xsz)*(ysz+1))
++      // So index is just i.
++      int idx_north = 0 * xsz + i;
++      float Q_north = (float)arrays->Qy[idx_north];
++      float h_north = (float)arrays->H[0 * xsz + i]; // Row 0
++
++      // BCs for Qy multiplies by dx. So unit_q = Qy / dx.
++      float unit_q_north = Q_north / dx;
++
++      d_north[3 * i + 0] = unit_q_north; // F.H
++      d_north[3 * i + 1] = 0.0f;         // F.HU (approx 0 shear)
++      if (h_north > 0.001f) {
++        // F.HV = v * F.H + ...
++        d_north[3 * i + 2] = (unit_q_north * unit_q_north / h_north) +
++                             0.5f * g * h_north * h_north;
++      } else {
++        d_north[3 * i + 2] = 0.0f;
++      }
++
++      // South
++      int idx_south = ysz * xsz + i;
++      float Q_south = (float)arrays->Qy[idx_south];
++      float h_south = (float)arrays->H[(ysz - 1) * xsz + i]; // Last Row
++      float unit_q_south = Q_south / dx;
++
++      d_south[3 * i + 0] = unit_q_south;
++      d_south[3 * i + 1] = 0.0f;
++      if (h_south > 0.001f) {
++        d_south[3 * i + 2] = (unit_q_south * unit_q_south / h_south) +
++                             0.5f * g * h_south * h_south;
++      } else {
++        d_south[3 * i + 2] = 0.0f;
++      }
++    }
++  }
++
++  // Refresh the prescribed boundary values for this timestep. Stage boundaries
++  // are shifted into the GPU's vertical datum so that (value - Z) is evaluated
++  // consistently with the shifted DEM; discharge boundaries are in m2/s and
++  // need no shift.
++  void updateBoundaryValues() {
++    if (!boundCs || !boundCs->BC_Ident || !boundaryValuesBuffer)
++      return;
++    float *d_val = (float *)[boundaryValuesBuffer contents];
++    const int num_bc_cells = 2 * geom.xsz + 2 * geom.ysz;
++    for (int i = 0; i < num_bc_cells; i++) {
++      switch (boundCs->BC_Ident[i]) {
++      case HFIX2:
++        d_val[i] = (float)boundCs->BC_Val[i] - dem_offset;
++        break;
++      case HVAR3:
++        d_val[i] = (float)InterpolateTimeSeries(boundCs->BC_TimeSeries[i], time) -
++                   dem_offset;
++        break;
++      case QFIX4:
++        d_val[i] = (float)boundCs->BC_Val[i];
++        break;
++      case QVAR5:
++        d_val[i] =
++            (float)InterpolateTimeSeries(boundCs->BC_TimeSeries[i], time);
++        break;
++      default:
++        d_val[i] = 0.0f;
++        break;
++      }
++    }
++  }
++
++  void applyPointSources() {
++    if (!boundCs || boundCs->numPS <= 0)
++      return;
++
++    int xsz = geom.xsz;
++    int ysz = geom.ysz;
++    float dx = geom.dx;
++    float dy = geom.dy;
++    float dt = solverParams.dt;
++    float cell_area = dx * dy;
++
++    // Get direct pointer to GPU H buffer (unified memory)
++    float *d_H = (float *)[H[current_buffer] contents];
++
++    for (int i = 0; i < boundCs->numPS; i++) {
++      int px = boundCs->xpi[i];
++      int py = boundCs->ypi[i];
++
++      if (px < 0 || px >= xsz || py < 0 || py >= ysz)
++        continue;
++
++      float val = 0.0f;
++      bool is_q_type = false;
++      if (boundCs->PS_Ident[i] == QVAR5) {
++        val = (float)InterpolateTimeSeries(boundCs->PS_TimeSeries[i], time);
++        is_q_type = true;
++      } else if (boundCs->PS_Ident[i] == QFIX4) {
++        val = (float)boundCs->PS_Val[i];
++        is_q_type = true;
++      } else if (boundCs->PS_Ident[i] == HVAR3) {
++        float h_target =
++            (float)InterpolateTimeSeries(boundCs->PS_TimeSeries[i], time);
++        float z = arrays->DEM[py * xsz + px];
++        float h_new = std::max(0.0f, h_target - z);
++        float h_old = d_H[(py + 1) * geom.pitch + (px + 1)];
++        val = (h_new - h_old) * cell_area / dt; // Calculate Q to match H
++        is_q_type = false;                      // Already scaled to m3/s
++      } else if (boundCs->PS_Ident[i] == HFIX2) {
++        float h_target = (float)boundCs->PS_Val[i];
++        float z = arrays->DEM[py * xsz + px];
++        float h_new = std::max(0.0f, h_target - z);
++        float h_old = d_H[(py + 1) * geom.pitch + (px + 1)];
++        val = (h_new - h_old) * cell_area / dt; // Calculate Q to match H
++        is_q_type = false;                      // Already scaled to m3/s
++      }
++
++      if (std::abs(val) > 1e-9f) {
++        float Q_total = is_q_type ? (val * dx) : val;
++
++        // GPU index (includes ghost cells)
++        int gpu_idx = (py + 1) * geom.pitch + (px + 1);
++
++        // Add volume: dH = Q_total * dt / Area
++        float dH = (Q_total * dt) / cell_area;
++
++        // Update GPU buffer directly (Unified memory)
++        d_H[gpu_idx] += dH;
++
++        // Update stats for mass balance (Qin is discharge m3/s)
++        if (Q_total > 0) {
++          boundCs->Qin += Q_total;
++          boundCs->VolInMT += (NUMERIC_TYPE)(Q_total * dt);
++        } else {
++          boundCs->Qout -= Q_total;
++          boundCs->VolOutMT -= (NUMERIC_TYPE)(Q_total * dt);
++        }
++      }
++    }
++  }
++
++  NUMERIC_TYPE computeTimestep() {
++    // Run compute_dt kernel
++    @autoreleasepool {
++      id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
++      id<MTLComputeCommandEncoder> encoder =
++          [commandBuffer computeCommandEncoder];
++
++      if (computeDtPipeline) {
++        // Reset minDtBuffer to max value before kernel
++        float max_dt_val = (float)max_dt;
++        uint32_t init_uint;
++        memcpy(&init_uint, &max_dt_val, sizeof(uint32_t));
++        memcpy([minDtBuffer contents], &init_uint, sizeof(uint32_t));
++
++        [encoder setComputePipelineState:computeDtPipeline];
++        [encoder setBuffer:H[current_buffer] offset:0 atIndex:0];
++        [encoder setBuffer:HU[current_buffer] offset:0 atIndex:1];
++        [encoder setBuffer:HV[current_buffer] offset:0 atIndex:2];
++
++        // Match kernel indices: 3:dt_field, 4:geom, 5:physics, 6:cfl, 7:max_dt
++        [encoder setBuffer:dt_field offset:0 atIndex:3];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:4];
++        [encoder setBuffer:physicsBuffer offset:0 atIndex:5];
++
++        float cfl_val = (float)solver->cfl;
++        [encoder setBytes:&cfl_val length:sizeof(float) atIndex:6];
++
++        float max_dt_f = (float)max_dt;
++        [encoder setBytes:&max_dt_f length:sizeof(float) atIndex:7];
++
++        [encoder setBytes:&max_dt_f length:sizeof(float) atIndex:7];
++        [encoder setBuffer:minDtBuffer
++                    offset:0
++                   atIndex:8]; // Bind minDt atomic buffer
++
++        MTLSize gridSize = MTLSizeMake(geom.xsz, geom.ysz, 1);
++        MTLSize threadGroupSize =
++            MTLSizeMake(16, 16, 1); // Optimized for M1 Max
++        [encoder dispatchThreads:gridSize
++            threadsPerThreadgroup:threadGroupSize];
++      }
++      [encoder endEncoding];
++      [commandBuffer commit];
++      [commandBuffer waitUntilCompleted];
++    }
++
++    // Read back reduction result from global buffer (Instant O(1))
++    uint32_t min_dt_uint;
++    memcpy(&min_dt_uint, [minDtBuffer contents], sizeof(uint32_t));
++
++    // Convert back to float
++    // Note: If no thread updated it (e.g. all dry), it remains max_dt logic
++    float min_dt = *(float *)&min_dt_uint;
++
++    // Sanity limit
++    if (min_dt <= 0.0f)
++      min_dt = (float)max_dt;
++
++    return (NUMERIC_TYPE)min_dt;
++  }
++
++  NUMERIC_TYPE step() {
++    // 0. Compute Adaptive Timestep
++    NUMERIC_TYPE adaptive_dt = computeTimestep();
++
++    if (is_first_step) {
++      adaptive_dt = states->adaptive_ts == ON ? (NUMERIC_TYPE)1e-6 : max_dt;
++      is_first_step = false;
++    }
++
++    solverParams.dt = (float)adaptive_dt;
++
++    // CRITICAL: Update solver->Tstep so BCs() uses the correct timestep
++    solver->Tstep = adaptive_dt;
++
++    // Update solver buffer
++    memcpy([solverBuffer contents], &solverParams, sizeof(MetalSolverParams));
++
++    int src = current_buffer;
++    int dst = 1 - current_buffer;
++
++    updateBoundaryValues();
++
++    // --- APPLY POINT SOURCES DIRECTLY TO GPU ---
++    // Point sources add water directly to current GPU buffer (unified memory)
++    applyPointSources();
++
++    // LoadRain has already converted the time series from mm/hour to m/s.
++    // Match the legacy Rainfall routine, including depth-limited negative rain.
++    if (states->rainfall == ON) {
++      float rate = (float)InterpolateTimeSeries(arrays->rain, time);
++      @autoreleasepool {
++        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
++        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
++        [encoder setComputePipelineState:applyUniformRainPipeline];
++        [encoder setBuffer:H[src] offset:0 atIndex:0];
++        [encoder setBuffer:DEM offset:0 atIndex:1];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:2];
++        [encoder setBytes:&rate length:sizeof(float) atIndex:3];
++        float dt = solverParams.dt;
++        [encoder setBytes:&dt length:sizeof(float) atIndex:4];
++        [encoder setBytes:&gpu_nodata length:sizeof(float) atIndex:5];
++        [encoder setBuffer:volOutBuffer offset:0 atIndex:6];
++        [encoder dispatchThreads:MTLSizeMake(geom.xsz, geom.ysz, 1)
++            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
++        [encoder endEncoding];
++        [commandBuffer commit];
++      }
++    }
++
++    // --- APPLY DYNAMIC RAIN ON GPU ---
++    if (dynamic_rain && dynamic_rain->enabled() && applyRainPipeline) {
++      dynamic_rain->update_time(time);
++
++      if (time >= last_rain_time + 1.0 || last_rain_time < 0) {
++        NUMERIC_TYPE *rdata = dynamic_rain->data();
++        size_t num_rain_cells =
++            dynamic_rain->geometry().xsz * dynamic_rain->geometry().ysz;
++        float *d_rain = (float *)[rainDataBuffer contents];
++
++        for (size_t k = 0; k < num_rain_cells; ++k)
++          d_rain[k] = (float)rdata[k];
++        const MetalGeometry &rg = *(const MetalGeometry *)[rainGeometryBuffer contents];
++        double sum = 0.0;
++        for (int j = 0; j < geom.ysz; ++j) {
++          for (int i = 0; i < geom.xsz; ++i) {
++            if (std::fabs(arrays->DEM[j * geom.xsz + i] - nodata) < 1e-6) continue;
++            int ri = (int)std::floor((geom.blx - rg.blx + i * geom.dx) / rg.dx);
++            int rj = (int)std::floor((j * geom.dy - (geom.tly - rg.tly)) / rg.dy);
++            if (ri >= 0 && ri < rg.xsz && rj >= 0 && rj < rg.ysz)
++              sum += std::max(0.0f, d_rain[rj * rg.xsz + ri]);
++          }
++        }
++        current_rain_sum = sum;
++        last_rain_time = time;
++
++        [rainDataBuffer
++            didModifyRange:NSMakeRange(0, num_rain_cells * sizeof(float))];
++      }
++
++      // Update mass balance (CPU side is much faster for global sums)
++      double interval_rain_vol =
++          current_rain_sum * (double)pars->dA * (double)adaptive_dt;
++      boundCs->VolInMT += (NUMERIC_TYPE)interval_rain_vol;
++      pars->RainTotalLoss += (NUMERIC_TYPE)interval_rain_vol;
++
++      @autoreleasepool {
++        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
++        id<MTLComputeCommandEncoder> encoder =
++            [commandBuffer computeCommandEncoder];
++        [encoder setComputePipelineState:applyRainPipeline];
++        [encoder setBuffer:H[src] offset:0 atIndex:0];
++        [encoder setBuffer:DEM offset:0 atIndex:1];
++        [encoder setBuffer:rainDataBuffer offset:0 atIndex:2];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:3];
++        [encoder setBuffer:rainGeometryBuffer offset:0 atIndex:4];
++        float dt_f = (float)adaptive_dt;
++        [encoder setBytes:&dt_f length:sizeof(float) atIndex:5];
++        float nd = gpu_nodata;
++        [encoder setBytes:&nd length:sizeof(float) atIndex:6];
++
++        [encoder dispatchThreads:MTLSizeMake(geom.xsz, geom.ysz, 1)
++            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
++        [encoder endEncoding];
++        [commandBuffer commit];
++        // PERFORMANCE: No waitUntilCompleted here.
++      }
++    }
++
++    // --- GPU KERNELS ---
++
++    @autoreleasepool {
++      id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
++      id<MTLComputeCommandEncoder> encoder =
++          [commandBuffer computeCommandEncoder];
++
++      MTLSize gridSize = MTLSizeMake(geom.xsz, geom.ysz, 1);
++      MTLSize threadGroupSize = MTLSizeMake(16, 16, 1); // Optimized for M1 Max
++
++      // Apply friction
++      if (applyFrictionPipeline && (has_manning_map || physics.manning > 0)) {
++        [encoder setComputePipelineState:applyFrictionPipeline];
++        [encoder setBuffer:H[src] offset:0 atIndex:0];
++        [encoder setBuffer:HU[src] offset:0 atIndex:1];
++        [encoder setBuffer:HV[src] offset:0 atIndex:2];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:3];
++        [encoder setBuffer:physicsBuffer offset:0 atIndex:4];
++        [encoder setBuffer:solverBuffer offset:0 atIndex:5];
++        [encoder setBuffer:manning offset:0 atIndex:6];
++        [encoder dispatchThreads:gridSize
++            threadsPerThreadgroup:threadGroupSize];
++      }
++
++      // Update ghost cells BEFORE flow calculations
++      if (updateGhostCellsPipeline) {
++        [encoder setComputePipelineState:updateGhostCellsPipeline];
++        [encoder setBuffer:H[src] offset:0 atIndex:0];
++        [encoder setBuffer:HU[src] offset:0 atIndex:1];
++        [encoder setBuffer:HV[src] offset:0 atIndex:2];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:3];
++        [encoder setBuffer:boundaryTypesBuffer offset:0 atIndex:4];
++
++        // Dispatch enough threads for max(pitch, ysz+2)
++        int maxBoundarySize = std::max(geom.pitch, geom.ysz + 2);
++        MTLSize ghostGridSize = MTLSizeMake(maxBoundarySize, 1, 1);
++        MTLSize ghostThreadGroupSize = MTLSizeMake(64, 1, 1);
++        [encoder dispatchThreads:ghostGridSize
++            threadsPerThreadgroup:ghostThreadGroupSize];
++      }
++
++      // X-sweep
++      // NOTE: Pass nil for boundary flux buffers to use HLL wall BCs
++      [encoder setComputePipelineState:updateFlowXPipeline];
++      [encoder setBuffer:H[src] offset:0 atIndex:0];
++      [encoder setBuffer:HU[src] offset:0 atIndex:1];
++      [encoder setBuffer:HV[src] offset:0 atIndex:2];
++      [encoder setBuffer:H_int offset:0 atIndex:3];
++      [encoder setBuffer:HU_int offset:0 atIndex:4];
++      [encoder setBuffer:HV_int offset:0 atIndex:5];
++      [encoder setBuffer:DEM offset:0 atIndex:6];
++      [encoder setBuffer:Zstar_x offset:0 atIndex:7];
++      [encoder setBuffer:geomBuffer offset:0 atIndex:8];
++      [encoder setBuffer:physicsBuffer offset:0 atIndex:9];
++      [encoder setBuffer:solverBuffer offset:0 atIndex:10];
++      [encoder setBuffer:boundaryTypesBuffer offset:0 atIndex:11];
++      [encoder setBuffer:boundaryValuesBuffer offset:0 atIndex:12];
++      [encoder setBuffer:volOutBuffer offset:0 atIndex:13];
++
++      // Overlapping threadgroups: tiles share interface fluxes through
++      // threadgroup memory, so they must overlap by one column in x (and one
++      // row in y below), matching the CUDA kernel's block layout.
++      {
++        MTLSize tg = MTLSizeMake(kTileX, kTileY, 1);
++        MTLSize groups = MTLSizeMake(
++            (geom.xsz + 1 + (kTileX - 1) - 1) / (kTileX - 1),
++            (geom.ysz + kTileY - 1) / kTileY, 1);
++        [encoder dispatchThreadgroups:groups threadsPerThreadgroup:tg];
++      }
++
++      // Y-sweep
++      // NOTE: Pass nil for boundary flux buffers to use HLL wall BCs
++      [encoder setComputePipelineState:updateFlowYPipeline];
++      [encoder setBuffer:H_int offset:0 atIndex:0];
++      [encoder setBuffer:HU_int offset:0 atIndex:1];
++      [encoder setBuffer:HV_int offset:0 atIndex:2];
++      [encoder setBuffer:H[src] offset:0 atIndex:3];
++      [encoder setBuffer:HU[src] offset:0 atIndex:4];
++      [encoder setBuffer:HV[src] offset:0 atIndex:5];
++      [encoder setBuffer:H[dst] offset:0 atIndex:6];
++      [encoder setBuffer:HU[dst] offset:0 atIndex:7];
++      [encoder setBuffer:HV[dst] offset:0 atIndex:8];
++      [encoder setBuffer:DEM offset:0 atIndex:9];
++      [encoder setBuffer:Zstar_y offset:0 atIndex:10];
++      [encoder setBuffer:geomBuffer offset:0 atIndex:11];
++      [encoder setBuffer:physicsBuffer offset:0 atIndex:12];
++      [encoder setBuffer:solverBuffer offset:0 atIndex:13];
++      [encoder setBuffer:boundaryTypesBuffer offset:0 atIndex:14];
++      [encoder setBuffer:boundaryValuesBuffer offset:0 atIndex:15];
++      [encoder setBuffer:volOutBuffer offset:0 atIndex:16];
++
++      {
++        MTLSize tg = MTLSizeMake(kTileX, kTileY, 1);
++        MTLSize groups = MTLSizeMake(
++            (geom.xsz + kTileX - 1) / kTileX,
++            (geom.ysz + 1 + (kTileY - 1) - 1) / (kTileY - 1), 1);
++        [encoder dispatchThreadgroups:groups threadsPerThreadgroup:tg];
++      }
++
++      [encoder endEncoding];
++      [commandBuffer commit];
++      [commandBuffer waitUntilCompleted];
++    }
++
++    // Drain water from NoData cells if enabled
++    if (pars->drain_nodata == ON && drainNodataPipeline) {
++      @autoreleasepool {
++        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
++        id<MTLComputeCommandEncoder> encoder =
++            [commandBuffer computeCommandEncoder];
++        [encoder setComputePipelineState:drainNodataPipeline];
++
++        [encoder setBuffer:H[dst] offset:0 atIndex:0];
++        [encoder setBuffer:HU[dst] offset:0 atIndex:1];
++        [encoder setBuffer:HV[dst] offset:0 atIndex:2];
++        [encoder setBuffer:DEM offset:0 atIndex:3];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:4];
++
++        float nd = gpu_nodata;
++        [encoder setBytes:&nd length:sizeof(float) atIndex:5];
++        [encoder setBuffer:volOutBuffer offset:0 atIndex:6];
++
++        MTLSize gridSize = MTLSizeMake(geom.xsz, geom.ysz, 1);
++        MTLSize threadGroupSize =
++            MTLSizeMake(16, 16, 1); // Optimized for M1 Max
++        [encoder dispatchThreads:gridSize
++            threadsPerThreadgroup:threadGroupSize];
++        [encoder endEncoding];
++        [commandBuffer commit];
++        [commandBuffer waitUntilCompleted];
++      }
++    }
++
++    // Track the running maximum depth (CPU equivalent: update_max_field() once
++    // per timestep in fv1::solve)
++    if (updateMaxFieldPipeline) {
++      @autoreleasepool {
++        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
++        id<MTLComputeCommandEncoder> encoder =
++            [commandBuffer computeCommandEncoder];
++        [encoder setComputePipelineState:updateMaxFieldPipeline];
++        [encoder setBuffer:H[dst] offset:0 atIndex:0];
++        [encoder setBuffer:maxH offset:0 atIndex:1];
++        [encoder setBuffer:geomBuffer offset:0 atIndex:2];
++        [encoder dispatchThreads:MTLSizeMake(geom.xsz, geom.ysz, 1)
++            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
++        [encoder endEncoding];
++        [commandBuffer commit];
++      }
++    }
++
++    current_buffer = dst;
++    time += (NUMERIC_TYPE)adaptive_dt;
++
++    // Report outflow to mass balance only when simulate() needs it (at
++    // interval) We'll add a helper to sync this correctly.
++
++    return (NUMERIC_TYPE)adaptive_dt;
++  }
++};
++
++Simulator::Simulator(Fnames &filenames, Pars &pars, ::Solver &solver,
++                     Arrays &arrays, States &states, BoundCs &boundCs,
++                     int verbose) {
++  impl = new SimulatorImpl();
++  impl->arrays = &arrays;
++  impl->boundCs = &boundCs;
++  impl->pars = &pars;
++  impl->solver = &solver;
++  impl->states = &states;
++
++  if (!impl->init(filenames, pars, solver, verbose)) {
++    delete impl;
++    impl = nullptr;
++  }
++}
++
++Simulator::~Simulator() {
++  if (impl)
++    delete impl;
++}
++
++void Simulator::initialize(NUMERIC_TYPE *H, NUMERIC_TYPE *HU, NUMERIC_TYPE *HV,
++                           NUMERIC_TYPE *DEM, NUMERIC_TYPE *Mann) {
++  if (impl) {
++    impl->copyToGPU(H, HU, HV, DEM, Mann);
++  }
++}
++
++NUMERIC_TYPE Simulator::step() {
++  if (impl) {
++    return impl->step();
++  }
++  return 0;
++}
++
++bool Simulator::is_available() {
++  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++  return device != nil;
++}
++
++void Simulator::copy_to_host(NUMERIC_TYPE *H, NUMERIC_TYPE *HU,
++                             NUMERIC_TYPE *HV) {
++  if (impl) {
++    impl->copyFromGPU(H, HU, HV);
++  }
++}
++
++void Simulator::copy_max_to_host(NUMERIC_TYPE *maxH) {
++  if (impl) {
++    impl->copyMaxFromGPU(maxH);
++  }
++}
++
++void simulate(Fnames &filenames, Files *files, States &states, Pars &pars,
++              ::Solver &solver, BoundCs &boundCs, Stage &stage, Arrays &arrays,
++              int verbose) {
++  if (states.rainfallmask == ON || states.routing == ON) {
++    fprintf(stderr, "ERROR: Metal FV1 does not support rainfallmask or rainfallrouting; "
++                    "use unmasked rainfall or dynamicrainfile.\n");
++    std::exit(EXIT_FAILURE);
++  }
++  if (states.rainfall == ON && !arrays.rain) {
++    fprintf(stderr, "ERROR: Metal FV1 requires a loaded rainfall time series.\n");
++    std::exit(EXIT_FAILURE);
++  }
++  Simulator sim(filenames, pars, solver, arrays, states, boundCs, verbose);
++
++  // Check if Metal initialization succeeded
++  if (!sim.is_valid()) {
++    printf("ERROR: Metal GPU initialization failed! Check that:\n");
++    printf("  1. Metal shader library (metal_fv1_kernels.metallib) exists\n");
++    printf("  2. Metal GPU is available on this system\n");
++    printf("  3. Single precision mode is enabled (NUMERIC_TYPE=float)\n");
++    return;
++  }
++
++  sim.initialize(arrays.H, arrays.HU, arrays.HV, arrays.DEM, arrays.Manningsn);
++
++  if (verbose) {
++    printf("Metal GPU initialized successfully.\n");
++    printf("Grid: %d x %d cells\n", pars.xsz, pars.ysz);
++    printf("SaveInt: %.2f, MassInt: %.2f\n", pars.SaveInt, pars.MassInt);
++    printf("Simulation time: %.2f seconds\n", solver.Sim_Time);
++    printf("\nStarting GPU simulation...\n\n");
++    fflush(stdout);
++  }
++
++  // Initialize Zstar fields (needed for bed slope source terms)
++  ::fv1::initialise_Zstar(&pars, &arrays);
++
++  // Main simulation loop
++  time_t loop_start;
++  time(&loop_start);
++
++  solver.MinTstep = solver.InitTstep;
++  solver.vol1 = DomainVol(&states, &pars, nullptr, &arrays, nullptr);
++
++  while (solver.t < solver.Sim_Time) {
++    // Reset Qin/Qout for this step (matches CPU behavior)
++    zero_flux_stats(&boundCs);
++
++    // Execute one timestep on GPU
++    NUMERIC_TYPE dt = sim.step();
++
++    if (dt <= 0) {
++      if (verbose)
++        printf("\nERROR: Metal simulator returned zero timestep.\n");
++      break;
++    }
++
++    if (solver.t > 0) {
++      solver.MinTstep = std::min(solver.MinTstep, dt);
++    }
++    solver.t += dt;
++    solver.itCount += 1;
++
++    // Progress output
++    if (verbose && solver.itCount % 100 == 0) {
++      printf("t=%.2f\tdt=%.6f\n", solver.t, dt);
++      fflush(stdout);
++    }
++
++    // Mass balance output
++    if (solver.t >= pars.MassTotal) {
++      sim.copy_to_host(arrays.H, arrays.HU, arrays.HV);
++
++      // Compute boundary fluxes for mass balance (Metal doesn't track these
++      // internally) We need to call the CPU FV1 functions to populate FHx/FHy
++      // arrays at boundaries
++      ::fv1::update_Hstar(&pars, &arrays);
++      ::fv1::update_fluxes(&pars, &solver, &arrays);
++      ::fv1::update_fluxes_on_boundaries(&pars, &solver, &boundCs, &arrays);
++      // GPU interface fluxes and point sources are already integrated per step.
++
++      // Virtual gauge output
++      if (states.gsection == ON && files->gau_fp) {
++        fprintf(files->gau_fp, "%12.2" NUM_FMT "", solver.t); // print time
++        for (int i = 0; i < stage.Ngauges; i++) {
++          // Calculate discharge using unit fluxes (FHx, FHy)
++          // CalcVirtualGauge sums up values in the unit flux arrays
++          NUMERIC_TYPE unit_discharge =
++              CalcVirtualGauge(i, pars.xsz + 1, arrays.FHx, arrays.FHy, &stage);
++
++          // Convert unit discharge (m2/s) to discharge (m3/s)
++          // Q = q * width
++          NUMERIC_TYPE discharge = 0.0;
++          if (stage.gauge_dir[i] == North || stage.gauge_dir[i] == South) {
++            discharge = unit_discharge * pars.dx;
++          } else {
++            discharge = unit_discharge * pars.dy;
++          }
++
++          fprintf(files->gau_fp, " %10.3" NUM_FMT "", discharge);
++        }
++        fprintf(files->gau_fp, "\n");
++        fflush(files->gau_fp);
++      }
++
++      update_mass_stats(&states, &pars, &solver, &boundCs, &arrays);
++      write_mass_stats(files, &pars, &solver, &boundCs);
++    }
++
++    // Solution output
++    if (solver.t >= pars.SaveTotal) {
++      sim.copy_to_host(arrays.H, arrays.HU, arrays.HV);
++      if (states.voutput == ON) {
++        update_velocity(&pars, &solver, &arrays);
++      }
++      write_solution(&filenames, &states, &pars, &solver, &arrays);
++    }
++  }
++
++  // Final copy and final solution output to ensure the last step is captured
++  // correctly
++  sim.copy_to_host(arrays.H, arrays.HU, arrays.HV);
++
++  if (states.voutput == ON) {
++    update_velocity(&pars, &solver, &arrays);
++  }
++
++  // Force a write of the final state (SaveNo will be correct)
++  write_solution(&filenames, &states, &pars, &solver, &arrays);
++
++  // The maximum depth field is tracked on the GPU every timestep; bring it
++  // back and write the .max file, as fv1::solve does on the CPU.
++  sim.copy_max_to_host(arrays.maxH);
++  write_max_field(&filenames, &states, &pars, &arrays);
++
++  time_t loop_end;
++  time(&loop_end);
++  double elapsed = difftime(loop_end, loop_start);
++
++  if (verbose) {
++    printf("\nloop time %lf\n", elapsed);
++    printf("Finished.\n\n");
++  }
++}
++
++} // namespace fv1
++} // namespace metal
++} // namespace lis
++
++#endif // __APPLE__
+diff -ruN a/metal/metal_integrate.cpp b/metal/metal_integrate.cpp
+--- a/metal/metal_integrate.cpp	1970-01-01 01:00:00
++++ b/metal/metal_integrate.cpp	2026-10-08 21:46:09
+@@ -0,0 +1,14 @@
++// LISFLOOD-FP Metal GPU back end: entry points called from lisflood.cpp
++#include "metal_integrate.h"
++#include "fv1/metal_fv1_simulate.h"
++
++bool metal_is_available() { return lis::metal::fv1::Simulator::is_available(); }
++
++void run_metal_fv1(Fnames &filenames, Files *files, States &states, Pars &pars,
++                   Solver &solver, BoundCs &boundCs, Stage &stage,
++                   Arrays &arrays, int verbose) {
++  if (verbose)
++    printf("\nUsing the Metal GPU (Apple Silicon) for the FV1 solver\n\n");
++  lis::metal::fv1::simulate(filenames, files, states, pars, solver, boundCs,
++                            stage, arrays, verbose);
++}
+diff -ruN a/metal/metal_integrate.h b/metal/metal_integrate.h
+--- a/metal/metal_integrate.h	1970-01-01 01:00:00
++++ b/metal/metal_integrate.h	2026-10-08 21:46:09
+@@ -0,0 +1,11 @@
++// LISFLOOD-FP Metal GPU back end: entry points called from lisflood.cpp
++#pragma once
++#include "../lisflood.h"
++
++// true when the machine has a Metal GPU the FV1 solver can use
++bool metal_is_available();
++
++// run the FV1 solver on the Metal GPU
++void run_metal_fv1(Fnames &filenames, Files *files, States &states, Pars &pars,
++                   Solver &solver, BoundCs &boundCs, Stage &stage,
++                   Arrays &arrays, int verbose);
+diff -ruN a/pars.cpp b/pars.cpp
+--- a/pars.cpp	2023-10-22 23:18:16
++++ b/pars.cpp	2026-10-08 21:46:09
+@@ -962,10 +962,11 @@
+ 			return;
+ 	}
+ 
+-	if (read_empty_param(param_name, line_number, param_value_ptr, "cuda", verbose, mode))
++	if (read_empty_param(param_name, line_number, param_value_ptr, "cuda", verbose, mode) ||
++		read_empty_param(param_name, line_number, param_value_ptr, "metal", verbose, mode))
+ 	{
+-		Statesptr->cuda = ON;
+-		if (verbose == ON) printf("CUDA enabled\n");
++		Statesptr->cuda = ON; // the GPU switch, for CUDA and Metal alike
++		if (verbose == ON) printf("GPU enabled\n");
+         return;
+ 	}
+ 
+@@ -1076,7 +1077,7 @@
+ 		exit(1);
+ 	}
+ 
+-#ifndef CUDA
++#if !defined(CUDA) && !defined(METAL_ENABLED)
+ 	if (Statesptr->cuda == ON)
+ 	{
+ 		printf("\nERROR: lisflood has not been compiled with CUDA support. Aborting...\n\n");
+diff -ruN a/preprocess/generateDG2DEM.cpp b/preprocess/generateDG2DEM.cpp
+--- a/preprocess/generateDG2DEM.cpp	2022-12-07 20:44:54
++++ b/preprocess/generateDG2DEM.cpp	2026-10-08 21:46:09
+@@ -41,6 +41,7 @@
+ 	States *Statesptr = &states;
+ 
+ 	Pars pars;
++	pars.nodata_elevation = DEM_NO_DATA; // same default as lisflood.cpp
+ 	Pars *Parptr = &pars;
+ 
+ 	Solver solver;
+diff -ruN a/preprocess/generateDG2start.cpp b/preprocess/generateDG2start.cpp
+--- a/preprocess/generateDG2start.cpp	2022-12-07 20:44:54
++++ b/preprocess/generateDG2start.cpp	2026-10-08 21:46:09
+@@ -41,6 +41,7 @@
+ 	States *Statesptr = &states;
+ 
+ 	Pars pars;
++	pars.nodata_elevation = DEM_NO_DATA; // same default as lisflood.cpp
+ 	Pars *Parptr = &pars;
+ 
+ 	Solver solver;

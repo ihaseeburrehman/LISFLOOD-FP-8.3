@@ -27,6 +27,9 @@ Tel: +44-117-928-9108, Fax: +44-117-928-7878
     #include "cuda/acc_nugrid/cuda_acc_nugrid_simulate.cuh"
 	#include "cuda/adaptive/cuda_adaptive_simulate.cuh"
 #endif
+#ifdef METAL_ENABLED
+	#include "metal/metal_integrate.h"
+#endif
 
 #include "lisflood2/file_tool.h"
 
@@ -774,6 +777,13 @@ int main(int argc, char *argv[])
 	}
 	else if (Statesptr->fv1 == ON)
 	{
+#ifdef METAL_ENABLED
+		// GPU requested (cuda or metal keyword) on an Apple Silicon Mac
+		if (Statesptr->cuda == ON && metal_is_available())
+			run_metal_fv1(*Fnameptr, &Fps, *Statesptr, *Parptr, *Solverptr, *BCptr,
+					*Stageptr, *Arrptr, verbosemode);
+		else
+#endif
 		fv1::solve(Fnameptr, &Fps, Statesptr, Parptr, Solverptr, BCptr,
 				Stageptr, Arrptr, verbosemode);
 	}
@@ -846,7 +856,7 @@ void printversion(int verbose)
 // printout header with program and version number
 {
   printf("***************************\n");
-  printf(" LISFLOOD-FP version %d.%d.%d (%s)\n", LF_VersionMajor, LF_VersionMinor, LF_VersionInc, NUMERIC_TYPE_NAME);
+  printf(" LISFLOOD-FP %s\n", LF_Release);
   if (verbose == ON)
   {
 #if defined (__INTEL_COMPILER)

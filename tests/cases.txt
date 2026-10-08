@@ -1,0 +1,27 @@
+# LISFLOOD-FP's own test material (testing/ in the 8.2 source), one line per case:
+#   name  directory-under-testing  par-file  solvers  preparation  par-fixes
+# preparation  -        nothing
+#              refine3  split every DEM cell into 3 x 3 (refine_dem.py), before dem
+#              dem      generateDG2DEM makes DEM + slopes from <DEMfile>.raw(.gz)
+#              start    generateDG2start makes start file + slopes from <startfile>.raw
+#              (both tools come from the same build as the executable under test;
+#              their output can differ slightly between platforms, so prepare once
+#              and copy work/data when comparing machines)
+# par-fixes    -                  par used as shipped
+#              drop:KEY,KEY       remove lines naming files that are not shipped
+#              KEY=VALUE          point KEY at the file that is shipped
+# The runner always sets dirroot, the solver keyword and the GPU keyword itself.
+fv1   fv1                   fv1.par              fv1,fv2,acc      -          -
+T01   UoS/T01               humps_cp.par         fv1,fv2,dg2,acc  -          -
+T02   UoS/T02               humps_db.par         fv1,fv2,dg2,acc  -          -
+T03   UoS/T03               humps_db_orig.par    fv1,fv2,dg2,acc  -          -
+T05   UoS/T05               25_blocks.par        fv1,fv2,dg2,acc  dem,start  drop:bcifile,stagefile
+T06   UoS/T06               ea5-10m.par          fv1,fv2,dg2,acc  dem        -
+T07   UoS/T07               carlisle-5m.par      fv1,fv2,dg2,acc  dem        bcifile=carlisle.bci
+T030  T030_DynamicRain      dynamicrain.par      fv1,fv2,dg2,acc  -          -
+T031  T031_IrregularFreeBC  irregularfreebc.par  fv1,fv2,dg2,acc  -          -
+# Large grid: Carlisle at 5/3 m (2853 x 1833 = 5.2 M cells), wider and taller
+# than one pass of the 128 x 128 launch grid; first 6 h of the event only.
+T07x3 UoS/T07               carlisle-5m.par      fv1,fv2,dg2,acc  refine3,dem  bcifile=carlisle.bci,sim_time=21600
+# Carlisle, first 6 h only: DG2 over the full 68 h takes about a day on one A100.
+T07s  UoS/T07               carlisle-5m.par      fv1,fv2,dg2,acc  dem        bcifile=carlisle.bci,sim_time=21600

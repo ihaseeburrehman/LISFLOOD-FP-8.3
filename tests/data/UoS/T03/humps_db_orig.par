@@ -1,0 +1,16 @@
+DEMfile         humps.dem
+resroot         humps_db_orig
+dirroot         humps_db_orig
+sim_time        60
+initial_tstep   10.0
+massint         1.0
+saveint         2
+fpfric          0.018	     	
+elevoff	
+voutput
+#acceleration
+#fv1
+dg2
+cuda
+startfile       humps_db_orig.wd
+#limitslopes
