@@ -1,0 +1,3 @@
+CXXFLAGS := -std=c++14 -Wall -O3 -parallel -qopenmp -static -qopt-report=2 -qopt-report-phase=vec -xhost -ipo -D_NUMERIC_MODE=1 -D_NETCDF=0 -D_ONLY_RECT=0
+LDFLAGS := -w -O3 -parallel -qopenmp -static-intel -lnuma
+

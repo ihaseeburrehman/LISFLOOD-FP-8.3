@@ -1,0 +1,15 @@
+# Compiling on Bristol Bluecrystal Phase 3 server with intel compiler (with netcdf)
+# module load languages/intel-compiler-16-u2
+# module load tools/cmake-3.17.5
+# export CXX=`which icpc`
+# export CC=`which icc`
+# cmake -S . -B build -D_CONFIG=config/bluepebble-intel-netcdf
+# cmake --build build
+#
+# CMAKE config:
+set(_NETCDF 1)
+add_compile_definitions(_NUMERIC_MODE=1)
+add_compile_definitions(_ONLY_RECT=1)
+set(CMAKE_CXX_FLAGS "-Wall -qopt-report=2 -qopt-report-phase=vec -xhost -ipo -parallel")
+set(NetCDF_LIBRARY "/cm/shared/libraries/intel_builds/netcdf-4.7.0-intel-16.par/lib/libnetcdf.so")
+set(NetCDF_INCLUDE_DIR "/cm/shared/libraries/intel_builds/netcdf-4.7.0-intel-16.par/include")

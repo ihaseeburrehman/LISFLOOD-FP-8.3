@@ -1,0 +1,5 @@
+CXXFLAGS := -std=c++14 -Wall -O3 -fopenmp -static -I$(HOME)/include -D_NETCDF=1 -D_NUMERIC_MODE=1
+LDFLAGS := -O3 -L$(HOME)/lib
+LDLIBS := -lgomp -lnuma -lnetcdf
+CUDA := yes
+NVCCFLAGS := -rdc=true -gencode=arch=compute_37,code=sm_37 -gencode=arch=compute_37,code=compute_37

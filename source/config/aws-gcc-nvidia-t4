@@ -1,0 +1,8 @@
+CUDA := yes
+NETCDF := yes
+
+CXXFLAGS := -std=c++14 -Wall -O3 -fopenmp -static -I/usr/local/cuda/include -D_NUMERIC_MODE=1 -D_NETCDF=0 -g
+LDFLAGS := -O3 -L/usr/local/cuda/lib
+LDLIBS := -lgomp -lnuma
+NVCCFLAGS := -rdc=true -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_75,code=compute_75
+
