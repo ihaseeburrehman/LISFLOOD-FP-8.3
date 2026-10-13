@@ -1,8 +1,10 @@
-# LISFLOOD-FP 8.3: faster flood simulation on NVIDIA GPUs and an Apple Metal back end for FV1
+# LISFLOOD-FP 8.3: faster flood simulation on NVIDIA GPUs and an Apple Metal back end for the first-order finite-volume solver
 
 LISFLOOD-FP 8.2 with faster, reproducible CUDA solvers and a new GPU back end
 for Apple computers (Metal, FV1 solver). The numerical method of 8.2 is
 unchanged.
+
+Archived release: [Zenodo, DOI 10.5281/zenodo.13121119](https://doi.org/10.5281/zenodo.13121119).
 
 ## Contents
 
